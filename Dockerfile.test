@@ -1,0 +1,2 @@
+FROM telegram-roleplay:dev
+COPY tests /app/tests

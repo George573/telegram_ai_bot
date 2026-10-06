@@ -1,0 +1,49 @@
+from decimal import Decimal
+import json
+from openai import OpenAI
+from storage import BudgetExceeded
+
+PRICES = {'gpt-6-luna': (Decimal('0.10'), Decimal('0.50')),
+          'gpt-5.6-luna': (Decimal('0.20'), Decimal('1.20'))}
+
+
+class ModelFailure(Exception):
+    pass
+
+
+def estimate_cost(model, instructions, history, output_limit):
+    input_rate, output_rate = PRICES[model]
+    # UTF-8 bytes upper-bound ordinary text tokens, with allowance for wrappers
+    # and cache-write pricing. Deliberately conservative, not billing authority.
+    byte_bound = len(json.dumps(history, ensure_ascii=False).encode()) + len(instructions.encode()) + 2048
+    return (Decimal(byte_bound) * input_rate * Decimal('1.25') + output_limit * output_rate) / 1000000
+
+
+class Model:
+    def __init__(self, config, store, client=None):
+        self.config, self.store = config, store
+        self.client = client or OpenAI(api_key=config.openai_key, max_retries=0, timeout=45)
+
+    def generate(self, instructions, history, output_tokens=None, max_chars=3500):
+        output_tokens = output_tokens or self.config.max_output_tokens
+        if len(instructions) + sum(len(x['content']) for x in history) > self.config.max_input_chars:
+            raise ModelFailure('Context too large')
+        reserved = estimate_cost(self.config.model, instructions, history, output_tokens)
+        self.store.reserve(reserved, self.config.budget)
+        # If a request fails or the process crashes, keep the conservative reservation.
+        try:
+            response = self.client.responses.create(model=self.config.model,
+                instructions=instructions, input=history, store=False,
+                reasoning={'effort': 'none'}, max_output_tokens=output_tokens)
+            usage = response.usage
+            if usage:
+                input_rate, output_rate = PRICES[self.config.model]
+                actual = (Decimal(usage.input_tokens) * input_rate * Decimal('1.25') + Decimal(usage.output_tokens) * output_rate) / 1000000
+                self.store.reconcile(reserved, actual)
+            if response.status != 'completed' or not response.output_text.strip():
+                raise ModelFailure('Incomplete response')
+            return response.output_text.strip()[:max_chars]
+        except ModelFailure:
+            raise
+        except Exception:
+            raise ModelFailure('Model request failed') from None

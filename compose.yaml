@@ -1,37 +1,51 @@
 services:
   bot:
     build: .
-    env_file: .env
     environment:
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?Set TELEGRAM_BOT_TOKEN in .env}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:?Set OPENAI_API_KEY in .env}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-6-luna}
+      ALLOWED_CHAT_IDS: ${ALLOWED_CHAT_IDS:?Set ALLOWED_CHAT_IDS in .env}
+      HISTORY_MAX_MESSAGES: ${HISTORY_MAX_MESSAGES:-50}
+      SUMMARY_MAX_CHARS: ${SUMMARY_MAX_CHARS:-4000}
+      BOT_BUDGET_USD: ${BOT_BUDGET_USD:-10}
+      REPLY_COOLDOWN_SECONDS: ${REPLY_COOLDOWN_SECONDS:-10}
       PGHOST: db
       PGDATABASE: roleplay
       PGUSER: roleplay
-      PGPASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      PGPASSWORD: ${BOT_DB_PASSWORD:?Set BOT_DB_PASSWORD in .env}
     depends_on:
       db:
         condition: service_healthy
+    networks: [backend, egress]
     restart: unless-stopped
     read_only: true
     tmpfs:
       - /tmp:size=16m,mode=1777
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
+    stop_grace_period: 60s
     logging:
       driver: local
       options:
         max-size: 5m
         max-file: "2"
   db:
-    image: postgres:17-bookworm
+    build:
+      context: .
+      dockerfile: Dockerfile.db
     environment:
       POSTGRES_DB: roleplay
-      POSTGRES_USER: roleplay
+      POSTGRES_USER: postgres
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      BOT_DB_PASSWORD: ${BOT_DB_PASSWORD:?Set BOT_DB_PASSWORD in .env}
     volumes:
       - database:/var/lib/postgresql/data
+    networks: [backend]
     restart: unless-stopped
+    security_opt: [no-new-privileges:true]
     healthcheck:
-      test: [CMD-SHELL, "pg_isready -U roleplay -d roleplay"]
+      test: [CMD-SHELL, "pg_isready -U postgres -d roleplay"]
       interval: 5s
       timeout: 3s
       retries: 20
@@ -42,3 +56,7 @@ services:
         max-file: "2"
 volumes:
   database:
+networks:
+  backend:
+    internal: true
+  egress:

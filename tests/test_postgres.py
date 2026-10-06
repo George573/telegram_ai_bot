@@ -1,0 +1,60 @@
+"""Run only against an isolated synthetic-credential test database."""
+from pathlib import Path
+from decimal import Decimal
+import sys
+import unittest
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
+import psycopg
+from psycopg.rows import dict_row
+from storage import Store, BudgetExceeded
+
+# Explicit opt-in marker supplied only by the isolated test runner, never private env.
+ENABLED = Path('/tmp/enable-isolated-postgres-tests').exists()
+
+
+@unittest.skipUnless(ENABLED, 'Isolated PostgreSQL integration runner required')
+class PostgresTests(unittest.TestCase):
+    def setUp(self):
+        self.conn=psycopg.connect('host=db dbname=roleplay user=roleplay password=test-only-password',autocommit=True,row_factory=dict_row)
+        self.store=Store(50,self.conn)
+        self.conn.execute('TRUNCATE messages, chats, jobs CASCADE')
+        self.conn.execute('UPDATE runtime SET next_update=0,spent=0')
+    def tearDown(self): self.conn.close()
+    def test_atomic_checkpoint_and_deduplication(self):
+        self.store.enqueue(10,dict(chat_id=-1))
+        self.store.enqueue(10,dict(chat_id=-1))
+        self.assertEqual(self.store.checkpoint(),11)
+        self.assertEqual(self.conn.execute('SELECT count(*) AS n FROM jobs').fetchone()['n'],1)
+    def test_state_and_queued_work_survive_reconnect(self):
+        self.store.state(-1)
+        self.store.setting(-1,'persona','Persistent cat')
+        self.store.append(-1,'user','Remember this')
+        self.store.enqueue(7,dict(chat_id=-1))
+        self.conn.close()
+        self.conn=psycopg.connect('host=db dbname=roleplay user=roleplay password=test-only-password',autocommit=True,row_factory=dict_row)
+        self.store=Store(50,self.conn)
+        self.assertEqual(self.store.state(-1)['persona'],'Persistent cat')
+        self.assertEqual(self.store.messages(-1)[0]['content'],'Remember this')
+        self.assertEqual(self.store.next_job()['update_id'],7)
+    def test_summary_transaction_rolls_back(self):
+        self.store.state(-1); self.store.append(-1,'user','original')
+        row=self.store.messages(-1)[0]
+        with self.assertRaises(RuntimeError):
+            with self.store.transaction():
+                self.store.save_summary(-1,'summary',row['id'])
+                raise RuntimeError('synthetic failure')
+        self.assertEqual(self.store.state(-1)['summary'],'')
+        self.assertEqual(self.store.messages(-1)[0]['content'],'original')
+    def test_allowance_persists_and_rejects_overspend(self):
+        self.store.reserve(Decimal('9'),Decimal('10'))
+        with self.assertRaises(BudgetExceeded): self.store.reserve(Decimal('2'),Decimal('10'))
+        self.assertEqual(self.store.spent(),Decimal('9'))
+    def test_application_role_is_not_administrator(self):
+        role=self.conn.execute('SELECT rolsuper,rolcreaterole FROM pg_roles WHERE rolname=current_user').fetchone()
+        self.assertFalse(role['rolsuper'])
+        self.assertFalse(role['rolcreaterole'])
+    def test_second_instance_rejected(self):
+        other=psycopg.connect('host=db dbname=roleplay user=roleplay password=test-only-password',autocommit=True,row_factory=dict_row)
+        try:
+            with self.assertRaises(RuntimeError): Store(50,other)
+        finally: other.close()

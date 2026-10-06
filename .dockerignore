@@ -2,5 +2,6 @@
 .env.*
 credentials
 .git
-tests
 __pycache__
+backups
+work
