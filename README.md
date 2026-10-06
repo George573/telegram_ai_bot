@@ -15,6 +15,9 @@ The assistant must not read `.env` or `credentials/`. Edit `.env` locally. Tests
 
 No database ports are exposed. Runtime secrets are injected into environment; avoid sharing `docker compose config` or inspection output because it can expose them.
 
+## Model
+The default is `gpt-6-luna` for both replies and rolling summaries. If your private `.env` already defines `OPENAI_MODEL`, update that entry yourself to `OPENAI_MODEL=gpt-6-luna`; environment configuration overrides the code default. The assistant will not read or modify the private file. Model access and live behavior have not been verified against your account.
+
 ## Commands
 Everyone: `/help`, `/chat <message>`, mentions and replies.
 Admins: `/setprompt <text>`, `/context directed|all`, `/historylimit 10..500`, `/resetmemory`, `/pause`, `/resume`, `/status`.

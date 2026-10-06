@@ -14,7 +14,7 @@ if not ALLOWED:
     raise RuntimeError("Configure ALLOWED_CHAT_IDS before starting")
 LIMIT = valid_limit(os.getenv("HISTORY_MAX_MESSAGES", "50"))
 SUMMARY_LIMIT = int(os.getenv("SUMMARY_MAX_CHARS", "4000"))
-MODEL = os.getenv("OPENAI_MODEL", "gpt-5.6-luna")
+MODEL = os.getenv("OPENAI_MODEL", "gpt-6-luna")
 client = AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"], max_retries=0, timeout=45)
 conn = psycopg.connect(autocommit=True)
 conn.execute("""CREATE TABLE IF NOT EXISTS chats (
