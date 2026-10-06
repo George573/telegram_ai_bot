@@ -1,0 +1,44 @@
+services:
+  bot:
+    build: .
+    env_file: .env
+    environment:
+      PGHOST: db
+      PGDATABASE: roleplay
+      PGUSER: roleplay
+      PGPASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    logging:
+      driver: local
+      options:
+        max-size: 5m
+        max-file: "2"
+  db:
+    image: postgres:17-bookworm
+    environment:
+      POSTGRES_DB: roleplay
+      POSTGRES_USER: roleplay
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes:
+      - database:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U roleplay -d roleplay"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    logging:
+      driver: local
+      options:
+        max-size: 5m
+        max-file: "2"
+volumes:
+  database:

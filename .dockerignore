@@ -1,0 +1,6 @@
+.env
+.env.*
+credentials
+.git
+tests
+__pycache__
