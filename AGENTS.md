@@ -5,4 +5,5 @@
 - Never overwrite an existing `.env`.
 - Use synthetic credentials and mocked network calls in tests. Live integration requires explicit user instruction.
 - Exclude secrets from Git, Docker build context, logs, and diagnostic output.
-- Subscription authentication must use official OAuth; no separately billed API fallback.
+- The selected authentication is a standard OPENAI_API_KEY with separate API billing. Never silently switch authentication providers or billing routes.
+- Do not run the bot or make billable requests without explicit authorization for live testing.

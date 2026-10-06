@@ -15,7 +15,7 @@ if not ALLOWED:
 LIMIT = valid_limit(os.getenv("HISTORY_MAX_MESSAGES", "50"))
 SUMMARY_LIMIT = int(os.getenv("SUMMARY_MAX_CHARS", "4000"))
 MODEL = os.getenv("OPENAI_MODEL", "gpt-5.6-luna")
-client = AsyncOpenAI(api_key=os.environ["OPENAI_ACCESS_TOKEN"], max_retries=0, timeout=45)
+client = AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"], max_retries=0, timeout=45)
 conn = psycopg.connect(autocommit=True)
 conn.execute("""CREATE TABLE IF NOT EXISTS chats (
  id BIGINT PRIMARY KEY, persona TEXT NOT NULL DEFAULT 'You are a playful family cat.',
