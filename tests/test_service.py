@@ -57,6 +57,9 @@ class FakeTelegram:
 
 class FakeModel:
     def __init__(self, fail=False): self.fail, self.calls = fail, []
+    def decide_reply(self, instructions, history):
+        self.generate(instructions, history)
+        return None
     def generate(self, instructions, history, **kwargs):
         self.calls.append((instructions, deepcopy(history)))
         if self.fail: raise ModelFailure()
@@ -101,7 +104,18 @@ class ServiceTests(unittest.TestCase):
         self.run_job('ordinary group message')
         self.assertEqual(len(self.store.rows), 1)
         self.assertFalse(self.tg.sent)
-        self.assertFalse(self.model.calls)
+        self.assertEqual(len(self.model.calls), 1)
+    def test_all_can_join_conversation(self):
+        self.store.chat['mode'] = 'all'
+        self.model.decide_reply = lambda *args: 'Meow'
+        self.run_job('cats are funny')
+        self.assertEqual(self.tg.sent, ['Meow'])
+        self.assertEqual([r['role'] for r in self.store.rows], ['user', 'assistant'])
+    def test_incidental_failure_is_silent(self):
+        self.store.chat['mode'] = 'all'; self.model.fail = True
+        self.run_job('ordinary chatter')
+        self.assertFalse(self.tg.sent)
+        self.assertEqual(len(self.store.rows), 1)
     def test_reset_clears_summary_and_history(self):
         self.tg.admin = True
         self.store.append(-1,'user','old'); self.store.chat['summary']='old summary'

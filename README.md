@@ -118,3 +118,5 @@ On the Pi, clone the repo, transfer `.env` over SSH, restore a backup if moving 
 See `./scripts/test.sh`. Tests use an explicit synthetic environment and isolated PostgreSQL database; never the private `.env`. The test database uses temporary memory storage and is removed afterward. No Telegram/OpenAI requests occur. Coverage includes permissions, anonymous admins, chat isolation, privacy filtering, memory/reset/summary failures, limit-change failures, delivery recovery, deduplication, persistence, spending reservations and single-instance locking.
 
 Telegram ID discovery has been verified live. OpenAI model access and role-play quality need a separately authorized live test after configuration. Do not claim those are verified by the mocked tests.
+
+In `all` mode, eligible group messages now receive a model decision: reply or stay silent. Decision and reply use one structured-output request; silent decisions still cost tokens. Direct mentions, replies and `/chat` receive a reply subject to pause, cooldown and budget limits. Incidental failures remain silent. Directed mode still discards unrelated messages.

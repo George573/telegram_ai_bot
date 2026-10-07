@@ -60,3 +60,21 @@ class ClientTests(unittest.TestCase):
         api=self.telegram(handler)
         with self.assertRaises(TelegramFailure) as caught: api.call('getMe')
         self.assertNotIn('fake-telegram-token',str(caught.exception))
+
+    def test_structured_decisions_are_validated(self):
+        for raw, expected in [(' {"respond":false,"reply":""}', None),
+                              ('{"respond":true,"reply":"Meow"}', 'Meow')]:
+            requests = []
+            def create(**params):
+                requests.append(params)
+                return SimpleNamespace(status='completed', output_text=raw, usage=None)
+            model = Model(Config('fake','fake',frozenset({-1})), Allowance(),
+                          SimpleNamespace(responses=SimpleNamespace(create=create)))
+            self.assertEqual(model.decide_reply('Cat', []), expected)
+            self.assertTrue(requests[0]['text']['format']['strict'])
+        for raw in ['broken', '{"respond":"false","reply":""}',
+                    '{"respond":false,"reply":"oops"}', '{"respond":true,"reply":""}']:
+            client = SimpleNamespace(responses=SimpleNamespace(create=lambda **_: SimpleNamespace(
+                status='completed', output_text=raw, usage=None)))
+            with self.assertRaises(ModelFailure):
+                Model(Config('fake','fake',frozenset({-1})), Allowance(), client).decide_reply('Cat', [])
