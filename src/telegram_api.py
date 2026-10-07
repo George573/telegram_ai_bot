@@ -1,3 +1,4 @@
+import re
 import httpx
 
 
@@ -10,6 +11,7 @@ class TelegramFailure(Exception):
 
 class TelegramAPI:
     def __init__(self, token):
+        self._file_base = 'https://api.telegram.org/file/bot' + token + '/'
         self._base = 'https://api.telegram.org/bot' + token + '/'
         self._http = httpx.Client(timeout=40, trust_env=False)
 
@@ -24,6 +26,29 @@ class TelegramAPI:
             raise
         except Exception:
             # No raw HTTP exceptions: URLs include the bot credential.
+            raise TelegramFailure() from None
+
+    def download(self, file_id, limit):
+        try:
+            info = self.call('getFile', file_id=file_id)
+            path = info.get('file_path', '')
+            if (not re.fullmatch(r'[A-Za-z0-9_./-]+', path) or path.startswith('/') or
+                    any(p in {'', '.', '..'} for p in path.split('/')) or info.get('file_size', 0) > limit):
+                raise TelegramFailure()
+            with self._http.stream('GET', self._file_base + path, follow_redirects=False) as response:
+                if response.status_code != 200 or int(response.headers.get('content-length', '0')) > limit:
+                    raise TelegramFailure()
+                output = bytearray()
+                for chunk in response.iter_bytes(chunk_size=65536):
+                    if len(output) + len(chunk) > limit:
+                        raise TelegramFailure()
+                    output.extend(chunk)
+                if not output:
+                    raise TelegramFailure()
+                return bytes(output)
+        except TelegramFailure:
+            raise
+        except Exception:
             raise TelegramFailure() from None
 
     def send(self, job, text):

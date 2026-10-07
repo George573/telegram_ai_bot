@@ -16,6 +16,8 @@ class Config:
     cooldown: int = 10
     max_input_chars: int = 30000
     max_output_tokens: int = 600
+    media_max_bytes: int = 5 * 1024 * 1024
+    voice_max_seconds: int = 120
     superadmin_ids: frozenset[int] = frozenset()
 
     @classmethod
@@ -31,7 +33,11 @@ class Config:
             summary_chars=int(os.getenv('SUMMARY_MAX_CHARS', '4000')),
             budget=Decimal(os.getenv('BOT_BUDGET_USD', '10')),
             cooldown=int(os.getenv('REPLY_COOLDOWN_SECONDS', '10')),
+            media_max_bytes=int(os.getenv('MEDIA_MAX_BYTES', '5242880')),
+            voice_max_seconds=int(os.getenv('VOICE_MAX_SECONDS', '120')),
             superadmin_ids=frozenset(int(x.strip()) for x in os.getenv('BOT_SUPERADMIN_IDS', '').split(',') if x.strip()))
+        if not 1024 <= config.media_max_bytes <= 10 * 1024 * 1024 or not 1 <= config.voice_max_seconds <= 300:
+            raise ValueError('Invalid media limits')
         if any(x <= 0 for x in config.superadmin_ids):
             raise ValueError('Super admins require positive Telegram user IDs')
         if config.model not in {'gpt-6-luna', 'gpt-5.6-luna'}:

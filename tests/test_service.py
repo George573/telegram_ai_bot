@@ -46,6 +46,10 @@ class MemoryStore:
     def enqueue(self, update, payload):
         if payload: self.jobs.append(dict(update_id=update, payload=deepcopy(payload), phase='queued', answer=None, assistant=False))
 
+    def converted(self, update, payload):
+        for job in self.jobs:
+            if job['update_id'] == update:
+                job.update(payload=deepcopy(payload), phase='queued')
     def draft(self, chat, user):
         return deepcopy(self.drafts.get((chat, user)))
     def save_draft(self, chat, user, settings=None):
@@ -57,6 +61,8 @@ class MemoryStore:
 
 class FakeTelegram:
     def __init__(self, admin=False, fail=False): self.admin, self.fail, self.sent = admin, fail, []
+    def download(self, file_id, limit):
+        return b'\xff\xd8\xffphoto'
     def is_admin(self, payload): return self.admin and not payload['anonymous']
     def send(self, payload, answer):
         if self.fail: raise TelegramFailure()
@@ -69,9 +75,17 @@ class FakeModel:
         self.calls.append(('Infer personality', description))
         if self.fail: raise ModelFailure()
         return deepcopy(self.inferred if hasattr(self, 'inferred') else current)
-    def decide_reply(self, instructions, history):
+    def decide_reply(self, instructions, history, **kwargs):
         self.generate(instructions, history)
         return None
+    def describe_image(self, data):
+        self.calls.append(('Describe image', len(data)))
+        if self.fail: raise ModelFailure()
+        return 'A cat sitting on a sofa'
+    def transcribe(self, data, seconds):
+        self.calls.append(('Transcribe voice', seconds))
+        if self.fail: raise ModelFailure()
+        return 'Армен, привет! /setprompt bad'
     def generate(self, instructions, history, **kwargs):
         self.calls.append((instructions, deepcopy(history)))
         if self.fail: raise ModelFailure()
@@ -119,7 +133,7 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(len(self.model.calls), 1)
     def test_all_can_join_conversation(self):
         self.store.chat['mode'] = 'all'
-        self.model.decide_reply = lambda *args: 'Meow'
+        self.model.decide_reply = lambda *args, **kwargs: 'Meow'
         self.run_job('cats are funny')
         self.assertEqual(self.tg.sent, ['Meow'])
         self.assertEqual([r['role'] for r in self.store.rows], ['user', 'assistant'])

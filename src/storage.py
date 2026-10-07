@@ -11,6 +11,9 @@ CREATE TABLE IF NOT EXISTS chats (
  history_limit INTEGER NOT NULL, summary TEXT NOT NULL DEFAULT '');
 ALTER TABLE chats ADD COLUMN IF NOT EXISTS last_reply TIMESTAMPTZ;
 ALTER TABLE chats ADD COLUMN IF NOT EXISTS personality JSONB NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE chats ADD COLUMN IF NOT EXISTS images_enabled BOOLEAN NOT NULL DEFAULT TRUE;
+ALTER TABLE chats ADD COLUMN IF NOT EXISTS voice_enabled BOOLEAN NOT NULL DEFAULT TRUE;
+ALTER TABLE chats ADD COLUMN IF NOT EXISTS web_enabled BOOLEAN NOT NULL DEFAULT TRUE;
 CREATE TABLE IF NOT EXISTS messages (
  id BIGSERIAL PRIMARY KEY, chat_id BIGINT NOT NULL REFERENCES chats(id),
  role TEXT NOT NULL, content TEXT NOT NULL);
@@ -30,6 +33,7 @@ CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY);
 INSERT INTO schema_version VALUES(1) ON CONFLICT DO NOTHING;
 INSERT INTO schema_version VALUES(2) ON CONFLICT DO NOTHING;
 INSERT INTO schema_version VALUES(3) ON CONFLICT DO NOTHING;
+INSERT INTO schema_version VALUES(4) ON CONFLICT DO NOTHING;
 '''
 
 
@@ -62,7 +66,7 @@ class Store:
         self.conn.execute("UPDATE chats SET summary='' WHERE id=%s", (chat_id,))
 
     def setting(self, chat_id, field, value):
-        if field not in {'persona', 'mode', 'paused', 'history_limit', 'personality'}:
+        if field not in {'persona', 'mode', 'paused', 'history_limit', 'personality', 'images_enabled', 'voice_enabled', 'web_enabled'}:
             raise ValueError('Invalid setting')
         if field == 'personality':
             value = Jsonb(value)
@@ -88,6 +92,9 @@ class Store:
 
     def phase(self, update_id, phase, answer=None, assistant=False):
         self.conn.execute('UPDATE jobs SET phase=%s,answer=%s,assistant=%s WHERE update_id=%s', (phase,answer,assistant,update_id))
+
+    def converted(self, update_id, payload):
+        self.conn.execute("UPDATE jobs SET payload=%s,phase='queued' WHERE update_id=%s", (Jsonb(payload), update_id))
 
     def finish(self, update_id):
         self.conn.execute('DELETE FROM jobs WHERE update_id=%s', (update_id,))

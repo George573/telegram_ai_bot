@@ -84,3 +84,18 @@ class PostgresTests(unittest.TestCase):
         self.conn.execute("UPDATE personality_drafts SET expires_at=now()-interval '1 second'")
         self.assertIsNone(self.store.draft(-1, 10))
         self.assertEqual(self.store.state(-1)['personality'], {})
+
+    def test_converted_media_and_feature_settings_survive_restart(self):
+        self.store.state(-1)
+        self.store.setting(-1, 'web_enabled', False)
+        self.store.setting(-1, 'images_enabled', False)
+        self.store.enqueue(5, {'chat_id': -1, 'media': {'file_id': 'synthetic-id'}, 'text': ''})
+        self.store.converted(5, {'chat_id': -1, 'media': None, 'text': '[Photo description] A sofa'})
+        self.conn.close()
+        self.conn = psycopg.connect('host=db dbname=roleplay user=roleplay password=test-only-password',
+                                   autocommit=True, row_factory=dict_row)
+        self.store = Store(50, self.conn)
+        self.assertFalse(self.store.state(-1)['web_enabled'])
+        self.assertFalse(self.store.state(-1)['images_enabled'])
+        self.assertIsNone(self.store.next_job()['payload']['media'])
+        self.assertNotIn('file_id', str(self.store.next_job()['payload']))

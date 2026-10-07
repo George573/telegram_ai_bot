@@ -109,3 +109,55 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(Config.load().superadmin_ids, frozenset({10, 20}))
             synthetic['BOT_SUPERADMIN_IDS'] = '-1'
             with self.assertRaises(ValueError): Config.load()
+
+    def test_file_download_is_bounded_and_redacts_token(self):
+        def handler(request):
+            if request.url.path.endswith('/getFile'):
+                return httpx.Response(200, json={'ok': True, 'result': {'file_path': 'photos/file_1.jpg'}})
+            self.assertEqual(request.url.host, 'api.telegram.org')
+            return httpx.Response(200, content=b'abcdef')
+        api = self.telegram(handler)
+        self.assertEqual(api.download('synthetic-file-id', 10), b'abcdef')
+        with self.assertRaises(TelegramFailure) as caught: api.download('synthetic-file-id', 3)
+        self.assertNotIn('fake-telegram-token', str(caught.exception))
+
+    def test_download_rejects_paths_redirects_and_unknown_length_overflow(self):
+        for path in ['https://evil.example/file', '../secret', '/etc/passwd', 'a//b']:
+            def handler(request):
+                self.assertTrue(request.url.path.endswith('/getFile'))
+                return httpx.Response(200, json={'ok': True, 'result': {'file_path': path}})
+            with self.assertRaises(TelegramFailure): self.telegram(handler).download('fake', 100)
+        class Chunks(httpx.SyncByteStream):
+            def __iter__(self): yield b'x'*70000
+        for redirect in [True, False]:
+            def handler(request):
+                if request.url.path.endswith('/getFile'):
+                    return httpx.Response(200, json={'ok': True, 'result': {'file_path': 'voice/file.oga'}})
+                if redirect: return httpx.Response(302, headers={'location': 'https://evil.example/file'})
+                return httpx.Response(200, stream=Chunks())
+            with self.assertRaises(TelegramFailure): self.telegram(handler).download('fake', 100)
+
+    def test_pinned_sdk_accepts_web_search_and_transcription_requests(self):
+        import json
+        from openai import OpenAI
+        requests = []
+        def handler(request):
+            requests.append(request)
+            if request.url.path.endswith('/audio/transcriptions'):
+                self.assertIn(b'gpt-transcribe', request.content)
+                return httpx.Response(200, json={'text': 'Hello', 'languages': [{'code': 'en'}]})
+            body = json.loads(request.content)
+            self.assertEqual(body['max_tool_calls'], 1)
+            self.assertEqual(body['tools'][0]['type'], 'web_search')
+            return httpx.Response(200, json={'id': 'resp_fake', 'object': 'response', 'created_at': 1,
+                'model': 'gpt-6-luna', 'status': 'completed', 'error': None, 'incomplete_details': None,
+                'output': [{'type': 'message', 'id': 'msg_fake', 'role': 'assistant', 'status': 'completed',
+                            'content': [{'type': 'output_text', 'text': 'Hello', 'annotations': []}]}],
+                'usage': {'input_tokens': 10, 'output_tokens': 2, 'total_tokens': 12}})
+        http = httpx.Client(transport=httpx.MockTransport(handler), trust_env=False)
+        self.addCleanup(http.close)
+        client = OpenAI(api_key='fake-key', http_client=http, max_retries=0)
+        model = Model(Config('fake', 'fake', frozenset({-1})), Allowance(), client)
+        self.assertEqual(model.generate('Cat', [], allow_search=True), 'Hello')
+        self.assertEqual(model.transcribe(b'fake-wav', 1), 'Hello')
+        self.assertEqual(len(requests), 2)
