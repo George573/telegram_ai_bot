@@ -18,5 +18,17 @@ class PolicyTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 valid_limit(value)
 
-if __name__ == '__main__':
-    unittest.main()
+    def test_character_names_match_whole_names(self):
+        from personality import named
+        state = {'personality': {'names': ['Cat', 'Mr. Whiskers', 'Кот']}}
+        self.assertTrue(named('Hi CAT!', state))
+        self.assertTrue(named('Эй Кот!', state))
+        self.assertTrue(named('Mr. Whiskers?', state))
+        self.assertFalse(named('caterpillar scatter @Catfish', state))
+
+    def test_personality_display_fits_telegram(self):
+        from personality import describe
+        state = {'personality': dict(style='s'*800, when='w'*800, lore='l'*2000,
+                                    names=['n'*40]*10, language='x'*80)}
+        self.assertLessEqual(len(describe(state)), 3500)
+        self.assertIn('stored settings are intact', describe(state))

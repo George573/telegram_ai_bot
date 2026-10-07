@@ -49,7 +49,7 @@ No ports are published. Only the bot has an outbound network. The database has a
 | `/resume` | Admin | Resume operation |
 | `/status` | Admin | Settings, retained count, summary presence, model and tracked allowance |
 
-Both context modes reply only when addressed. Admin privileges are checked with Telegram before every settings operation. Anonymous-admin commands are rejected because the person cannot be identified. Failed verification denies the change. The model cannot authorize commands, execute code, use tools, or change configuration. Only allowed group IDs are processed. Service events, other bots, media, channels, private chats and oversized messages are ignored.
+Directed mode replies only when addressed. All mode also lets the model decide whether to join other group conversations. Admin privileges are checked with Telegram before every settings operation. Anonymous-admin commands are rejected because the person cannot be identified. Failed verification denies the change. The model cannot authorize commands, execute code, use tools, or change configuration. Only allowed group IDs are processed. Service events, other bots, media, channels, private chats and oversized messages are ignored.
 
 ## Memory and restart behavior
 
@@ -120,3 +120,18 @@ See `./scripts/test.sh`. Tests use an explicit synthetic environment and isolate
 Telegram ID discovery has been verified live. OpenAI model access and role-play quality need a separately authorized live test after configuration. Do not claim those are verified by the mocked tests.
 
 In `all` mode, eligible group messages now receive a model decision: reply or stay silent. Decision and reply use one structured-output request; silent decisions still cost tokens. Direct mentions, replies and `/chat` receive a reply subject to pause, cooldown and budget limits. Incidental failures remain silent. Directed mode still discards unrelated messages.
+
+Admins can view persistent character settings with `/personality`, or update one field:
+
+```text
+/personality names Mittens, Kitty, Кот
+/personality eagerness quiet
+/personality when Join conversations about food or cats
+/personality style Short playful sentences, occasional meows
+/personality lore A spoiled royal cat who believes the sofa is a throne
+/personality language auto
+```
+
+Eagerness accepts `quiet`, `balanced` (default), or `chatty`; it guides the model rather than setting a numeric probability. Named mentions count as directed messages and receive replies. Names match whole names without case sensitivity. Telegram must deliver the message: disable privacy mode via BotFather for plain-name recognition, then re-add the bot if needed. In directed context mode other messages remain discarded.
+
+Use `-` to clear a field, or `/personality reset` to restore structured defaults. Names/style/eagerness/when/language changes retain conversation; lore changes and reset clear history and summary to avoid conflicting character facts. `/setprompt` remains the base persona. Settings are stored locally in PostgreSQL with an automatic additive migration. Only identifiable admins can view or change them. Decisions use [OpenAI structured outputs](https://developers.openai.com/api/docs/guides/structured-outputs), validated locally before sending text.

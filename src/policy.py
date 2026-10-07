@@ -1,6 +1,6 @@
 import re
 
-ADMIN_COMMANDS = {'/setprompt', '/context', '/historylimit', '/resetmemory', '/pause', '/resume', '/status'}
+ADMIN_COMMANDS = {'/personality', '/setprompt', '/context', '/historylimit', '/resetmemory', '/pause', '/resume', '/status'}
 
 
 def addressed(text, username, reply_to_bot=False):

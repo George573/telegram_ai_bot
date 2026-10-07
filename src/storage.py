@@ -10,6 +10,7 @@ CREATE TABLE IF NOT EXISTS chats (
  mode TEXT NOT NULL DEFAULT 'directed', paused BOOLEAN NOT NULL DEFAULT FALSE,
  history_limit INTEGER NOT NULL, summary TEXT NOT NULL DEFAULT '');
 ALTER TABLE chats ADD COLUMN IF NOT EXISTS last_reply TIMESTAMPTZ;
+ALTER TABLE chats ADD COLUMN IF NOT EXISTS personality JSONB NOT NULL DEFAULT '{}'::jsonb;
 CREATE TABLE IF NOT EXISTS messages (
  id BIGSERIAL PRIMARY KEY, chat_id BIGINT NOT NULL REFERENCES chats(id),
  role TEXT NOT NULL, content TEXT NOT NULL);
@@ -23,6 +24,7 @@ CREATE TABLE IF NOT EXISTS jobs (
  phase TEXT NOT NULL DEFAULT 'queued', answer TEXT, assistant BOOLEAN NOT NULL DEFAULT FALSE);
 CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY);
 INSERT INTO schema_version VALUES(1) ON CONFLICT DO NOTHING;
+INSERT INTO schema_version VALUES(2) ON CONFLICT DO NOTHING;
 '''
 
 
@@ -55,8 +57,10 @@ class Store:
         self.conn.execute("UPDATE chats SET summary='' WHERE id=%s", (chat_id,))
 
     def setting(self, chat_id, field, value):
-        if field not in {'persona', 'mode', 'paused', 'history_limit'}:
+        if field not in {'persona', 'mode', 'paused', 'history_limit', 'personality'}:
             raise ValueError('Invalid setting')
+        if field == 'personality':
+            value = Jsonb(value)
         self.conn.execute(f'UPDATE chats SET {field}=%s WHERE id=%s', (value,chat_id))
 
     def save_summary(self, chat_id, summary, through_id):

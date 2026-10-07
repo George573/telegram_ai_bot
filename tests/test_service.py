@@ -161,3 +161,29 @@ class ServiceTests(unittest.TestCase):
         simple=estimate_cost('gpt-6-luna','Cat',[{'role':'user','content':'hello'}],600)
         large=estimate_cost('gpt-6-luna','Cat',[{'role':'user','content':'😺'*1000}],600)
         self.assertGreater(large,simple)
+
+    def test_personality_admin_only_and_persistent_names(self):
+        self.run_job('/personality names Mittens')
+        self.assertNotIn('personality', self.store.chat)
+        self.tg.admin = True
+        self.run_job('/personality names Mittens, Kitty')
+        self.assertEqual(self.store.chat['personality']['names'], ['Mittens', 'Kitty'])
+        self.tg.sent.clear()
+        self.service = Service(self.config, self.store, self.tg, self.model)
+        self.run_job('Hey mittens!')
+        self.assertEqual(self.tg.sent, ['Meow'])
+    def test_personality_validation_and_lore_reset(self):
+        self.tg.admin = True
+        self.store.append(-1, 'user', 'old lore')
+        self.run_job('/personality eagerness invalid')
+        self.assertNotIn('personality', self.store.chat)
+        self.run_job('/personality style short and funny')
+        self.assertEqual(len(self.store.rows), 1)
+        self.run_job('/personality lore A royal cat')
+        self.assertFalse(self.store.rows)
+        self.assertEqual(self.store.chat['personality']['style'], 'short and funny')
+    def test_personality_is_in_model_prompt(self):
+        self.store.chat['personality'] = dict(eagerness='quiet', lore='Royal cat', style='Puns')
+        self.run_job('hello @Cat')
+        self.assertIn('Royal cat', self.model.calls[-1][0])
+        self.assertIn('Almost always stay silent', self.model.calls[-1][0])

@@ -28,12 +28,14 @@ class PostgresTests(unittest.TestCase):
     def test_state_and_queued_work_survive_reconnect(self):
         self.store.state(-1)
         self.store.setting(-1,'persona','Persistent cat')
+        self.store.setting(-1,'personality',dict(names=['Mittens'], eagerness='quiet', lore='Royal cat'))
         self.store.append(-1,'user','Remember this')
         self.store.enqueue(7,dict(chat_id=-1))
         self.conn.close()
         self.conn=psycopg.connect('host=db dbname=roleplay user=roleplay password=test-only-password',autocommit=True,row_factory=dict_row)
         self.store=Store(50,self.conn)
         self.assertEqual(self.store.state(-1)['persona'],'Persistent cat')
+        self.assertEqual(self.store.state(-1)['personality']['names'], ['Mittens'])
         self.assertEqual(self.store.messages(-1)[0]['content'],'Remember this')
         self.assertEqual(self.store.next_job()['update_id'],7)
     def test_summary_transaction_rolls_back(self):
@@ -58,3 +60,11 @@ class PostgresTests(unittest.TestCase):
         try:
             with self.assertRaises(RuntimeError): Store(50,other)
         finally: other.close()
+
+    def test_personality_migration_preserves_existing_chats(self):
+        self.store.state(-1)
+        self.store.append(-1, 'user', 'Existing memory')
+        self.conn.execute('ALTER TABLE chats DROP COLUMN personality')
+        self.store = Store(50, self.conn)
+        self.assertEqual(self.store.state(-1)['personality'], {})
+        self.assertEqual(self.store.messages(-1)[0]['content'], 'Existing memory')
