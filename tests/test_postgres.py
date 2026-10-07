@@ -68,3 +68,19 @@ class PostgresTests(unittest.TestCase):
         self.store = Store(50, self.conn)
         self.assertEqual(self.store.state(-1)['personality'], {})
         self.assertEqual(self.store.messages(-1)[0]['content'], 'Existing memory')
+
+    def test_drafts_persist_scope_and_expire_without_changing_character(self):
+        from personality import DEFAULTS
+        self.store.state(-1); self.store.state(-2)
+        self.store.save_draft(-1, 10, {**DEFAULTS, 'lore': 'Proposed character'})
+        self.assertIsNone(self.store.draft(-1, 20))
+        self.assertIsNone(self.store.draft(-2, 10))
+        self.conn.close()
+        self.conn = psycopg.connect('host=db dbname=roleplay user=roleplay password=test-only-password',
+                                   autocommit=True, row_factory=dict_row)
+        self.store = Store(50, self.conn)
+        self.assertEqual(self.store.draft(-1, 10)['settings']['lore'], 'Proposed character')
+        self.assertEqual(self.store.state(-1)['personality'], {})
+        self.conn.execute("UPDATE personality_drafts SET expires_at=now()-interval '1 second'")
+        self.assertIsNone(self.store.draft(-1, 10))
+        self.assertEqual(self.store.state(-1)['personality'], {})

@@ -1,16 +1,79 @@
-from personality import named, instructions, update as update_personality, describe
+from personality import named, instructions, settings, DEFAULTS, validate, describe
 from policy import ADMIN_COMMANDS, compact_plan, valid_limit
 from storage import BudgetExceeded
 from model import ModelFailure
 from telegram_api import TelegramFailure
 
-BASE_HELP = 'Talk with /chat <message>, mention me, use a configured character name, or reply to me. /help works while paused.'
-ADMIN_HELP = '\nAdmins: /personality [field value], /setprompt <instructions>, /context directed|all, /historylimit 10..500, /resetmemory, /pause, /resume, /status'
+BASE_HELP = ('Talk with /chat <message>, mention me, use a configured character name, or reply to me. '
+             '/help works while paused. /whoami shows your Telegram user ID.')
+ADMIN_HELP = ('\nSettings managers: /personality, /setprompt <instructions>, /context directed|all, '
+              '/historylimit 10..500, /resetmemory, /pause, /resume, /status\n'
+              'Personality: send /personality, then reply with a plain-language character description. '
+              'Or send it directly: /personality A warm Armenian friend named Армен or Ара, '
+              'speaking Russian with Armenian slang and joining conversations often.\n'
+              'I infer names, eagerness, when to speak, style, lore and language. '
+              'Review, then /personality save or /personality cancel. /personality show displays saved settings. '
+              'Descriptions use the AI budget; drafts expire after 30 minutes. '
+              'Lore changes clear memory when saved. Participation still respects context, pause and cooldown.')
+WIZARD_HELP = ('\nDescribe the character in your next reply to me, in any language. '
+               'Include names, speaking style, backstory and how often to speak. '
+               'I will show a preview before saving. /personality cancel exits; drafts expire after 30 minutes.')
+PREVIEW_HELP = ('\nPreview only. Send /personality save (or reply “да”) to apply, '
+                '/personality cancel to discard, or reply with a revised description. '
+                'Changing character lore clears conversation memory on save. '
+                'To join all group chatter, a settings manager must also use /context all.')
 
 
 class Service:
     def __init__(self, config, store, telegram, model):
         self.config, self.store, self.telegram, self.model = config, store, telegram, model
+
+    def can_manage(self, payload):
+        if payload['anonymous'] or not payload.get('user_id'):
+            return False
+        return payload['user_id'] in self.config.superadmin_ids or self.telegram.is_admin(payload)
+
+    def personality(self, job, argument):
+        payload = job['payload']
+        chat_id, user_id = payload['chat_id'], payload['user_id']
+        state = self.store.state(chat_id)
+        control = argument.strip().casefold()
+        draft = self.store.draft(chat_id, user_id)
+        if control == 'show':
+            self.queue_answer(job, describe(state))
+        elif not argument:
+            with self.store.transaction():
+                self.store.save_draft(chat_id, user_id)
+                self.queue_answer(job, describe(state) + WIZARD_HELP)
+        elif control in {'cancel', 'отмена', 'нет'}:
+            with self.store.transaction():
+                self.store.delete_drafts(chat_id, user_id)
+                self.queue_answer(job, 'Personality setup cancelled. Saved settings are unchanged.')
+        elif control in {'save', 'yes', 'да', 'сохранить'}:
+            if not draft or draft['settings'] is None:
+                self.queue_answer(job, 'No pending preview. Send /personality and describe your character first.')
+                return
+            value = validate(draft['settings'])
+            changed_lore = value['lore'] != settings(state)['lore']
+            with self.store.transaction():
+                self.store.setting(chat_id, 'personality', value)
+                if changed_lore:
+                    self.store.clear(chat_id)
+                # Other people's previews were based on the previous saved character.
+                self.store.delete_drafts(chat_id)
+                self.queue_answer(job, 'Saved. ' + describe(self.store.state(chat_id)) +
+                                  ('\nConversation memory cleared for the new lore.' if changed_lore else ''))
+        else:
+            if len(argument) > 6000:
+                raise ValueError('Describe your character in at most 6000 characters.')
+            if control == 'reset':
+                value = DEFAULTS.copy()
+            else:
+                current = draft['settings'] if draft and draft['settings'] is not None else settings(state)
+                value = validate(self.model.infer_personality(argument, current))
+            with self.store.transaction():
+                self.store.save_draft(chat_id, user_id, value)
+                self.queue_answer(job, describe({'personality': value}) + PREVIEW_HELP)
 
     def compact(self, chat_id, limit=None, slots=0):
         state = self.store.state(chat_id)
@@ -51,6 +114,10 @@ class Service:
             payload = dict(payload)
             payload['directed'] = payload['directed'] or named(payload['text'], state)
             command = payload['command']
+            draft = None if payload['anonymous'] or not payload.get('user_id') else self.store.draft(payload['chat_id'], payload['user_id'])
+            if not command and draft and payload.get('reply_to_bot'):
+                payload['command'], payload['argument'] = '/personality', payload['text']
+                command = '/personality'
             if not command and (state['paused'] or (state['mode'] == 'directed' and not payload['directed'])):
                 payload = None
         self.store.enqueue(update_id, payload)
@@ -67,25 +134,28 @@ class Service:
     def command(self, job):
         payload = job['payload']
         chat_id, command, argument = payload['chat_id'], payload['command'], payload['argument'].strip()
+        if command == '/whoami':
+            self.queue_answer(job, 'Anonymous senders cannot be identified.' if payload['anonymous'] else
+                              f"Your Telegram user ID: {payload['user_id']}")
+            return
         if command == '/help':
             state = self.store.state(chat_id)
             text = BASE_HELP + '\nContext: ' + state['mode'] + '. In all mode, group text may be sent to OpenAI and I may choose to join in.'
-            if self.telegram.is_admin(payload):
+            if self.can_manage(payload):
                 text += ADMIN_HELP
             self.queue_answer(job, text)
             return
-        if not self.telegram.is_admin(payload):
-            self.queue_answer(job, 'This command requires an identifiable group admin.')
+        if not self.can_manage(payload):
+            if payload.get('user_id') and not payload['anonymous']:
+                self.store.delete_drafts(chat_id, payload['user_id'])
+            self.queue_answer(job, 'This command requires an identifiable group admin or configured bot super admin.')
             return
         clear = False
         field, value = None, None
         try:
             if command == '/personality':
-                if not argument:
-                    self.queue_answer(job, describe(self.store.state(chat_id)))
-                    return
-                field, value = 'personality', update_personality(self.store.state(chat_id), argument)
-                clear = argument.split(maxsplit=1)[0].lower() in {'lore', 'reset'}
+                self.personality(job, argument)
+                return
             elif command == '/setprompt':
                 if not argument or len(argument) > 8000:
                     raise ValueError('Provide a persona of 1–8000 characters.')
@@ -107,17 +177,19 @@ class Service:
                     self.store.setting(chat_id, field, value)
                 if clear:
                     self.store.clear(chat_id)
-                self.queue_answer(job, describe(self.store.state(chat_id)) if command == '/personality' else self.status(chat_id))
+                if field == 'persona':
+                    self.store.delete_drafts(chat_id)
+                self.queue_answer(job, self.status(chat_id))
         except ValueError as error:
             self.queue_answer(job, str(error))
         except (ModelFailure, BudgetExceeded):
-            self.queue_answer(job, 'Memory operation could not complete. Existing history and settings were retained.')
+            self.queue_answer(job, 'AI settings or memory operation could not complete. Saved settings and memory were retained; check /status and try again.')
 
     def prepare(self, job):
         payload = job['payload']
         chat_id = payload['chat_id']
         state = self.store.state(chat_id)
-        if payload['command'] in ADMIN_COMMANDS | {'/help'}:
+        if payload['command'] in ADMIN_COMMANDS | {'/help', '/whoami'}:
             self.command(job)
             return
         if state['paused'] or (state['mode'] == 'directed' and not payload['directed']):

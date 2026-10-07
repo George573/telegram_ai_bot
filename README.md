@@ -40,16 +40,18 @@ No ports are published. Only the bot has an outbound network. The database has a
 |---|---|---|
 | `/help` | Everyone | Usage and applicable commands; no AI request or memory entry |
 | `/chat <text>` | Everyone | Request a reply |
-| `/setprompt <instructions>` | Admin | Replace persona and clear all conversation memory |
-| `/context directed` | Admin | Use only conversations addressed to the bot; clear memory |
-| `/context all` | Admin | Use general group text as context; clear memory |
-| `/historylimit 10..500` | Admin | Override the retained message count for that group |
-| `/resetmemory` | Admin | Remove recent messages and summary |
-| `/pause` | Admin | Stop new conversation collection and AI replies |
-| `/resume` | Admin | Resume operation |
-| `/status` | Admin | Settings, retained count, summary presence, model and tracked allowance |
+| `/whoami` | Everyone | Show your Telegram user ID; no AI request |
+| `/personality [description]` | Settings manager | Describe a character, review inferred settings, then save or cancel |
+| `/setprompt <instructions>` | Settings manager | Replace persona and clear all conversation memory |
+| `/context directed` | Settings manager | Use only conversations addressed to the bot; clear memory |
+| `/context all` | Settings manager | Use general group text as context; clear memory |
+| `/historylimit 10..500` | Settings manager | Override the retained message count for that group |
+| `/resetmemory` | Settings manager | Remove recent messages and summary |
+| `/pause` | Settings manager | Stop new conversation collection and AI replies |
+| `/resume` | Settings manager | Resume operation |
+| `/status` | Settings manager | Settings, retained count, summary presence, model and tracked allowance |
 
-Directed mode replies only when addressed. All mode also lets the model decide whether to join other group conversations. Admin privileges are checked with Telegram before every settings operation. Anonymous-admin commands are rejected because the person cannot be identified. Failed verification denies the change. The model cannot authorize commands, execute code, use tools, or change configuration. Only allowed group IDs are processed. Service events, other bots, media, channels, private chats and oversized messages are ignored.
+Directed mode replies only when addressed. All mode also lets the model decide whether to join other group conversations. Settings managers are identifiable Telegram group admins and configured bot super admins. Group-admin privileges are verified with Telegram for every settings operation; super admins are matched by numeric user ID. Anonymous senders cannot use either role because the person cannot be identified. Failed group-admin verification denies access unless the sender is a configured super admin. The model cannot authorize commands, execute code, use tools, or change configuration. Only allowed group IDs are processed. Service events, other bots, media, channels, private chats and oversized messages are ignored.
 
 ## Memory and restart behavior
 
@@ -121,17 +123,30 @@ Telegram ID discovery has been verified live. OpenAI model access and role-play 
 
 In `all` mode, eligible group messages now receive a model decision: reply or stay silent. Decision and reply use one structured-output request; silent decisions still cost tokens. Direct mentions, replies and `/chat` receive a reply subject to pause, cooldown and budget limits. Incidental failures remain silent. Directed mode still discards unrelated messages.
 
-Admins can view persistent character settings with `/personality`, or update one field:
+## Personality setup
+
+Send `/personality` and reply to the bot with an ordinary description in your preferred language. You can also send everything in one message:
 
 ```text
-/personality names Mittens, Kitty, Кот
-/personality eagerness quiet
-/personality when Join conversations about food or cats
-/personality style Short playful sentences, occasional meows
-/personality lore A spoiled royal cat who believes the sofa is a throne
-/personality language auto
+/personality Ты — теплый, гостеприимный армянский друг. Откликайся на Армен, Ара и Карен. Часто вступай в разговор. Пиши эмоционально, с легким юмором и уважением, по-русски с армянским сленгом: джан, апер, барев. Любишь хорошую еду, дружбу и семью.
 ```
 
-Eagerness accepts `quiet`, `balanced` (default), or `chatty`; it guides the model rather than setting a numeric probability. Named mentions count as directed messages and receive replies. Names match whole names without case sensitivity. Telegram must deliver the message: disable privacy mode via BotFather for plain-name recognition, then re-add the bot if needed. In directed context mode other messages remain discarded.
+The model infers names, eagerness, speaking guidance, style, lore and language and shows a preview. No settings change yet. Send `/personality save` (or reply `да`) to apply it, `/personality cancel` to discard it, or reply with a revised description. `/personality show` displays the saved settings. `/personality reset` previews the defaults for confirmation. No field syntax, quotes or pipes are required; pasted descriptions with those constructs are interpreted as text. Numeric eagerness in a description is mapped to qualitative guidance; it is not a response probability.
 
-Use `-` to clear a field, or `/personality reset` to restore structured defaults. Names/style/eagerness/when/language changes retain conversation; lore changes and reset clear history and summary to avoid conflicting character facts. `/setprompt` remains the base persona. Settings are stored locally in PostgreSQL with an automatic additive migration. Only identifiable admins can view or change them. Decisions use [OpenAI structured outputs](https://developers.openai.com/api/docs/guides/structured-outputs), validated locally before sending text.
+Inference uses one bounded AI request and the existing spending allowance. Viewing, saving and cancelling do not call OpenAI. Drafts belong to one user in one group, survive restarts and expire after 30 minutes; expired drafts are removed on the next draft lookup. While a draft is open, only replies to the bot from that user enter the setup flow. Ordinary messages keep their normal behavior. Descriptions are not added to conversation memory. Only the inferred settings are retained as a draft after its job finishes. Permission is checked again before each setup step or save. Saving invalidates other people's pending previews for that group.
+
+Changing lore on save clears history and summary to avoid conflicting character facts. Other personality edits retain conversation. `/setprompt` remains the base prompt; character lore overrides conflicting identity details in it. Changing that prompt also cancels pending personality drafts.
+
+Eagerness is `quiet`, `balanced` (default), or `chatty`; it guides the model. It does not bypass context mode, pause, budget or cooldown. Use `/context all` if the character should consider joining general group chatter. Named mentions count as directed messages. Names match whole names without case sensitivity. Telegram must deliver messages: disable privacy mode via BotFather for plain-name recognition, then re-add the bot if needed. Directed mode discards other messages.
+
+## Bot super admins
+
+Send `/whoami` in the approved group to see your numeric Telegram user ID. Add trusted user IDs to your private `.env`, for example:
+
+```dotenv
+BOT_SUPERADMIN_IDS=123456789,987654321
+```
+
+Recreate the bot after changing this value. Those users can manage all chat settings without Telegram group-admin status, including personality, prompt, context, memory, pause and resume. Existing identifiable group admins also retain access. Super admins cannot operate outside `ALLOWED_CHAT_IDS`, change credentials or the owner's spending allowance through chat, or be inferred/granted by the model. Usernames and forwarded text do not grant access. Membership in this list can only be changed in local configuration. An empty list adds no super admins. The assistant does not read or update your private `.env`.
+
+Settings and drafts are stored in local PostgreSQL through automatic additive migrations. Model extraction and reply decisions use [OpenAI structured outputs](https://developers.openai.com/api/docs/guides/structured-outputs), validated locally before application.

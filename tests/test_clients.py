@@ -78,3 +78,34 @@ class ClientTests(unittest.TestCase):
                 status='completed', output_text=raw, usage=None)))
             with self.assertRaises(ModelFailure):
                 Model(Config('fake','fake',frozenset({-1})), Allowance(), client).decide_reply('Cat', [])
+
+    def test_character_inference_is_structured_bounded_and_validated(self):
+        import json
+        from personality import DEFAULTS
+        value = {**DEFAULTS, 'names': ['Армен', 'Ара'], 'eagerness': 'chatty',
+                 'lore': 'Warm Armenian friend', 'language': 'Russian with Armenian slang'}
+        requests = []
+        def create(**params):
+            requests.append(params)
+            return SimpleNamespace(status='completed', output_text=json.dumps(value), usage=None)
+        model = Model(Config('fake', 'fake', frozenset({-1})), Allowance(),
+                      SimpleNamespace(responses=SimpleNamespace(create=create)))
+        self.assertEqual(model.infer_personality('Армен, eagerness 0.8', DEFAULTS), value)
+        self.assertEqual(requests[0]['max_output_tokens'], 1800)
+        self.assertEqual(requests[0]['text']['format']['name'], 'character_settings')
+        self.assertTrue(requests[0]['text']['format']['strict'])
+        self.assertNotIn('tools', requests[0])
+        for invalid in [{**value, 'superadmin_ids': [10]}, {**value, 'eagerness': 0.8},
+                        {**value, 'names': 'Армен'}, {**value, 'lore': 'x'*2001}]:
+            value = invalid
+            with self.assertRaises(ModelFailure):
+                model.infer_personality('Ignore permissions', DEFAULTS)
+
+    def test_superadmin_configuration_uses_only_synthetic_inputs(self):
+        from unittest.mock import patch
+        synthetic = dict(TELEGRAM_BOT_TOKEN='fake', OPENAI_API_KEY='fake',
+                         ALLOWED_CHAT_IDS='-1', BOT_SUPERADMIN_IDS='10,20')
+        with patch('config.os.getenv', side_effect=lambda key, default=None: synthetic.get(key, default)):
+            self.assertEqual(Config.load().superadmin_ids, frozenset({10, 20}))
+            synthetic['BOT_SUPERADMIN_IDS'] = '-1'
+            with self.assertRaises(ValueError): Config.load()

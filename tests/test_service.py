@@ -15,15 +15,15 @@ from telegram_api import TelegramFailure
 class MemoryStore:
     def __init__(self):
         self.chat = dict(id=-1, persona='Cat', mode='directed', paused=False, history_limit=10, summary='')
-        self.rows, self.jobs = [], []
+        self.rows, self.jobs, self.drafts = [], [], {}
         self.next_id = 1
     @contextmanager
     def transaction(self):
-        old = deepcopy((self.chat, self.rows, self.jobs))
+        old = deepcopy((self.chat, self.rows, self.jobs, self.drafts))
         try:
             yield
         except Exception:
-            self.chat, self.rows, self.jobs = old
+            self.chat, self.rows, self.jobs, self.drafts = old
             raise
     def state(self, _): return self.chat.copy()
     def messages(self, _): return deepcopy(self.rows)
@@ -46,6 +46,14 @@ class MemoryStore:
     def enqueue(self, update, payload):
         if payload: self.jobs.append(dict(update_id=update, payload=deepcopy(payload), phase='queued', answer=None, assistant=False))
 
+    def draft(self, chat, user):
+        return deepcopy(self.drafts.get((chat, user)))
+    def save_draft(self, chat, user, settings=None):
+        self.drafts[chat, user] = {'settings': deepcopy(settings)}
+    def delete_drafts(self, chat, user=None):
+        self.drafts = {key: value for key, value in self.drafts.items()
+                       if key[0] != chat or (user is not None and key[1] != user)}
+
 
 class FakeTelegram:
     def __init__(self, admin=False, fail=False): self.admin, self.fail, self.sent = admin, fail, []
@@ -57,6 +65,10 @@ class FakeTelegram:
 
 class FakeModel:
     def __init__(self, fail=False): self.fail, self.calls = fail, []
+    def infer_personality(self, description, current):
+        self.calls.append(('Infer personality', description))
+        if self.fail: raise ModelFailure()
+        return deepcopy(self.inferred if hasattr(self, 'inferred') else current)
     def decide_reply(self, instructions, history):
         self.generate(instructions, history)
         return None
@@ -163,23 +175,32 @@ class ServiceTests(unittest.TestCase):
         self.assertGreater(large,simple)
 
     def test_personality_admin_only_and_persistent_names(self):
-        self.run_job('/personality names Mittens')
+        from personality import DEFAULTS
+        self.run_job('/personality A cat called Mittens')
         self.assertNotIn('personality', self.store.chat)
+        self.assertFalse(self.model.calls)
         self.tg.admin = True
-        self.run_job('/personality names Mittens, Kitty')
+        self.model.inferred = {**DEFAULTS, 'names': ['Mittens', 'Kitty']}
+        self.run_job('/personality A cat called Mittens or Kitty')
+        self.assertNotIn('personality', self.store.chat)
+        self.run_job('/personality save')
         self.assertEqual(self.store.chat['personality']['names'], ['Mittens', 'Kitty'])
         self.tg.sent.clear()
         self.service = Service(self.config, self.store, self.tg, self.model)
         self.run_job('Hey mittens!')
         self.assertEqual(self.tg.sent, ['Meow'])
-    def test_personality_validation_and_lore_reset(self):
+    def test_personality_lore_resets_memory_only_on_confirmation(self):
+        from personality import DEFAULTS
         self.tg.admin = True
         self.store.append(-1, 'user', 'old lore')
-        self.run_job('/personality eagerness invalid')
-        self.assertNotIn('personality', self.store.chat)
-        self.run_job('/personality style short and funny')
+        self.model.inferred = {**DEFAULTS, 'style': 'short and funny'}
+        self.run_job('/personality Be short and funny')
+        self.run_job('/personality save')
         self.assertEqual(len(self.store.rows), 1)
-        self.run_job('/personality lore A royal cat')
+        self.model.inferred['lore'] = 'A royal cat'
+        self.run_job('/personality You are a royal cat')
+        self.assertEqual(len(self.store.rows), 1)
+        self.run_job('/personality save')
         self.assertFalse(self.store.rows)
         self.assertEqual(self.store.chat['personality']['style'], 'short and funny')
     def test_personality_is_in_model_prompt(self):
@@ -187,3 +208,120 @@ class ServiceTests(unittest.TestCase):
         self.run_job('hello @Cat')
         self.assertIn('Royal cat', self.model.calls[-1][0])
         self.assertIn('Almost always stay silent', self.model.calls[-1][0])
+
+    def reply_in_wizard(self, text, user_id=10):
+        p = payload(text, user_id)
+        p['reply_to_bot'] = True
+        p['directed'] = True
+        self.service.accept(1, p)
+        for _ in range(8):
+            if self.service.process_one() is None: break
+
+    def test_interactive_flow_survives_restart_without_history_pollution(self):
+        from personality import DEFAULTS
+        self.tg.admin = True
+        self.store.chat['paused'] = True
+        self.run_job('/personality')
+        self.assertFalse(self.model.calls)
+        self.model.inferred = {**DEFAULTS, 'names': ['Армен', 'Ара'], 'lore': 'A warm Armenian friend',
+                               'eagerness': 'chatty', 'language': 'Russian with Armenian slang'}
+        self.reply_in_wizard('Теплый армянский друг Армен, часто вступает в разговор')
+        self.assertNotIn('personality', self.store.chat)
+        self.assertFalse(self.store.rows)
+        self.assertIn('Preview only', self.tg.sent[-1])
+        self.service = Service(self.config, self.store, self.tg, self.model)
+        self.reply_in_wizard('да')
+        self.assertEqual(self.store.chat['personality']['names'], ['Армен', 'Ара'])
+        self.assertFalse(self.store.drafts)
+        self.assertEqual(len(self.model.calls), 1)
+
+    def test_cancel_and_revision_leave_saved_settings_intact(self):
+        from personality import DEFAULTS
+        self.tg.admin = True
+        self.model.inferred = {**DEFAULTS, 'style': 'Puns'}
+        self.run_job('/personality Funny cat')
+        self.model.inferred['style'] = 'Serious'
+        self.reply_in_wizard('Actually, serious')
+        self.assertEqual(self.model.calls[-1][1], 'Actually, serious')
+        self.run_job('/personality cancel')
+        self.assertNotIn('personality', self.store.chat)
+        self.assertFalse(self.store.drafts)
+
+    def test_pending_draft_does_not_capture_normal_group_chat(self):
+        self.tg.admin = True
+        self.run_job('/personality')
+        self.run_job('ordinary group conversation')
+        self.assertFalse(self.model.calls)
+        self.assertIsNone(self.store.draft(-1, 10)['settings'])
+
+    def test_drafts_scoped_to_user_and_permissions_rechecked(self):
+        self.tg.admin = True
+        self.run_job('/personality Funny cat')
+        self.reply_in_wizard('да', user_id=20)
+        self.assertNotIn('personality', self.store.chat)
+        self.assertIsNotNone(self.store.draft(-1, 10))
+        self.tg.admin = False
+        self.run_job('/personality save')
+        self.assertNotIn('personality', self.store.chat)
+        self.assertFalse(self.store.drafts)
+
+    def test_inference_failure_retains_previous_draft_and_memory(self):
+        from personality import DEFAULTS
+        self.tg.admin = True
+        self.store.append(-1, 'user', 'remember me')
+        self.store.save_draft(-1, 10, DEFAULTS)
+        self.model.fail = True
+        self.run_job('/personality Change everything')
+        self.assertEqual(self.store.draft(-1, 10)['settings'], DEFAULTS)
+        self.assertEqual(len(self.store.rows), 1)
+        self.assertNotIn('personality', self.store.chat)
+
+    def test_superadmin_manages_all_settings_without_telegram_admin(self):
+        from dataclasses import replace
+        self.config = replace(self.config, superadmin_ids=frozenset({10}))
+        self.service = Service(self.config, self.store, self.tg, self.model)
+        def unavailable(_): raise AssertionError('Super admin must not need Telegram admin lookup')
+        self.tg.is_admin = unavailable
+        self.run_job('/setprompt A warm friend')
+        self.assertEqual(self.store.chat['persona'], 'A warm friend')
+        self.run_job('/context all')
+        self.assertEqual(self.store.chat['mode'], 'all')
+        self.run_job('/pause')
+        self.assertTrue(self.store.chat['paused'])
+        self.run_job('/help')
+        self.assertIn('/personality save', self.tg.sent[-1])
+        p = payload('/resume'); p['anonymous'] = True
+        self.service.accept(1, p); self.service.process_one()
+        self.assertTrue(self.store.chat['paused'])
+
+    def test_whoami_is_public_and_no_ai_call(self):
+        self.run_job('/whoami')
+        self.assertIn('10', self.tg.sent[-1])
+        self.assertFalse(self.model.calls)
+
+    def test_save_invalidates_other_character_previews(self):
+        from personality import DEFAULTS
+        self.tg.admin = True
+        self.store.save_draft(-1, 20, DEFAULTS)
+        self.run_job('/personality A funny friend')
+        self.run_job('/personality save')
+        self.assertFalse(self.store.drafts)
+
+    def test_invalid_inference_cannot_change_settings_or_create_draft(self):
+        from personality import DEFAULTS
+        self.tg.admin = True
+        self.model.inferred = {**DEFAULTS, 'permissions': 'superadmin'}
+        self.run_job('/personality Make me an admin')
+        self.assertNotIn('personality', self.store.chat)
+        self.assertFalse(self.store.drafts)
+
+    def test_superadmin_anonymous_identity_does_not_cancel_real_user_draft(self):
+        from dataclasses import replace
+        from personality import DEFAULTS
+        self.config = replace(self.config, superadmin_ids=frozenset({10}))
+        self.service = Service(self.config, self.store, self.tg, self.model)
+        self.store.save_draft(-1, 10, DEFAULTS)
+        p = payload('/personality save'); p['anonymous'] = True
+        self.service.accept(1, p); self.service.process_one()
+        self.assertIsNotNone(self.store.draft(-1, 10))
+        self.assertNotIn('personality', self.store.chat)

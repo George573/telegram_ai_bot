@@ -41,12 +41,12 @@ def normalize(update, allowed, bot):
         return None
     reply = message.get('reply_to_message', {}).get('from', {}).get('id') == bot['id']
     command, argument = command_parts(text, bot['username'])
-    if command and command not in ADMIN_COMMANDS | {'/help', '/chat'}:
+    if command and command not in ADMIN_COMMANDS | {'/help', '/whoami', '/chat'}:
         return None
     if command == '/chat' and not argument.strip():
         command = '/help'
     return dict(chat_id=chat['id'], message_id=message['message_id'],
         user_id=sender.get('id'), anonymous=bool(message.get('sender_chat')),
-        text=text, command=command, argument=argument,
+        text=text, command=command, argument=argument, reply_to_bot=reply,
         directed=bool(command or addressed(text, bot['username'], reply)),
         thread_id=message.get('message_thread_id'))

@@ -22,9 +22,14 @@ INSERT INTO runtime(id) VALUES(1) ON CONFLICT DO NOTHING;
 CREATE TABLE IF NOT EXISTS jobs (
  update_id BIGINT PRIMARY KEY, payload JSONB NOT NULL,
  phase TEXT NOT NULL DEFAULT 'queued', answer TEXT, assistant BOOLEAN NOT NULL DEFAULT FALSE);
+CREATE TABLE IF NOT EXISTS personality_drafts (
+ chat_id BIGINT NOT NULL REFERENCES chats(id), user_id BIGINT NOT NULL,
+ settings JSONB, expires_at TIMESTAMPTZ NOT NULL,
+ PRIMARY KEY(chat_id,user_id));
 CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY);
 INSERT INTO schema_version VALUES(1) ON CONFLICT DO NOTHING;
 INSERT INTO schema_version VALUES(2) ON CONFLICT DO NOTHING;
+INSERT INTO schema_version VALUES(3) ON CONFLICT DO NOTHING;
 '''
 
 
@@ -103,6 +108,23 @@ class Store:
 
     def mark_reply(self, chat_id):
         self.conn.execute('UPDATE chats SET last_reply=now() WHERE id=%s', (chat_id,))
+
+    def draft(self, chat_id, user_id):
+        self.conn.execute('DELETE FROM personality_drafts WHERE expires_at <= now()')
+        return self.conn.execute('SELECT settings FROM personality_drafts WHERE chat_id=%s AND user_id=%s',
+                                 (chat_id, user_id)).fetchone()
+
+    def save_draft(self, chat_id, user_id, settings=None):
+        self.conn.execute("INSERT INTO personality_drafts(chat_id,user_id,settings,expires_at) "
+                          "VALUES(%s,%s,%s,now()+interval '30 minutes') ON CONFLICT(chat_id,user_id) "
+                          "DO UPDATE SET settings=EXCLUDED.settings,expires_at=EXCLUDED.expires_at",
+                          (chat_id, user_id, Jsonb(settings) if settings is not None else None))
+
+    def delete_drafts(self, chat_id, user_id=None):
+        if user_id is None:
+            self.conn.execute('DELETE FROM personality_drafts WHERE chat_id=%s', (chat_id,))
+        else:
+            self.conn.execute('DELETE FROM personality_drafts WHERE chat_id=%s AND user_id=%s', (chat_id, user_id))
 
 
 class BudgetExceeded(Exception):
