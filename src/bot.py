@@ -26,7 +26,8 @@ def main():
         store = Store(config.history_limit)
         telegram = TelegramAPI(config.telegram_token)
         identity = telegram.call('getMe')
-        service = Service(config, store, telegram, Model(config, store))
+        service = Service(config, store, telegram, Model(config, store),
+                          privacy_enabled=not identity.get('can_read_all_group_messages', False))
         print('Bot started; local persistent storage ready.', flush=True)
         while not STOP:
             delay = service.process_one()

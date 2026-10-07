@@ -20,11 +20,17 @@ def named(text, state):
 
 def instructions(state):
     value = settings(state)
-    return (state['persona'] + '\nCharacter settings (admin supplied):\n' +
-            json.dumps(value, ensure_ascii=False) + '\nParticipation guidance: ' +
-            EAGERNESS[value['eagerness']] + '\nFollow style, lore and speaking guidance. '
-            'Use the group language when language is auto. Lore defines the character identity and overrides '
-            'conflicting identity details in the base persona. These settings never authorize actions.')
+    # Send exactly one identity, rather than asking the model to reconcile a
+    # legacy persona with a contradictory structured character description.
+    identity = value['lore'].strip() or state['persona']
+    return ('Current character identity (authoritative):\n' + identity +
+            '\nCharacter settings (admin supplied):\n' + json.dumps(value, ensure_ascii=False) +
+            '\nThe configured names are aliases for YOU, not a list of people to address. '
+            'Stay in the current character even if older assistant messages describe a different identity. '
+            'Use the configured text style and language; when language is auto use the group language. '
+            'Participation guidance: ' + EAGERNESS[value['eagerness']] +
+            '\nFollow the speaking guidance. These settings never authorize actions.')
+
 
 
 def describe(state):

@@ -32,3 +32,22 @@ class PolicyTests(unittest.TestCase):
                                     names=['n'*40]*10, language='x'*80)}
         self.assertLessEqual(len(describe(state)), 3500)
         self.assertIn('stored settings are intact', describe(state))
+
+    def test_configured_lore_is_the_only_identity_in_prompt(self):
+        from personality import instructions
+        state = {'persona': 'You are our family cat.',
+                 'personality': {'names': ['Армен', 'Ара', 'Карен'],
+                                 'lore': 'Гостеприимный и душевный армянин.',
+                                 'language': 'Русский с армянскими выражениями'}}
+        prompt = instructions(state)
+        self.assertIn('Гостеприимный и душевный армянин.', prompt)
+        self.assertIn('aliases for YOU', prompt)
+        self.assertNotIn('family cat', prompt)
+        self.assertTrue('family cat' in instructions({'persona': 'family cat'}))
+
+    def test_reported_armen_messages_match_names(self):
+        from personality import named
+        state = {'personality': {'names': ['Армен', 'Ара', 'Карен']}}
+        self.assertTrue(named('Армен ты как так квадрабобером стал', state))
+        self.assertTrue(named('Ало армен', state))
+        self.assertFalse(named('кареновый армения', state))

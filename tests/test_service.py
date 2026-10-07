@@ -325,3 +325,40 @@ class ServiceTests(unittest.TestCase):
         self.service.accept(1, p); self.service.process_one()
         self.assertIsNotNone(self.store.draft(-1, 10))
         self.assertNotIn('personality', self.store.chat)
+
+    def test_directed_messages_bypass_incidental_cooldown(self):
+        self.store.chat['personality'] = {'names': ['Армен', 'Ара', 'Карен'], 'lore': 'Душевный армянин.'}
+        self.store.cooling_down = lambda *_: True
+        self.run_job('/chat ты кто такой по жизни')
+        self.run_job('Армен ты как так квадрабобером стал')
+        self.run_job('Ало армен')
+        self.assertEqual(self.tg.sent, ['Meow', 'Meow', 'Meow'])
+        self.assertEqual(len(self.model.calls), 3)
+        self.assertNotIn('Cat', self.model.calls[-1][0])
+        self.assertIn('Душевный армянин.', self.model.calls[-1][0])
+
+    def test_incidental_cooldown_preserves_context_without_request(self):
+        self.store.chat['mode'] = 'all'
+        self.store.cooling_down = lambda *_: True
+        self.run_job('ordinary group text')
+        self.assertEqual(len(self.store.rows), 1)
+        self.assertFalse(self.model.calls)
+        self.assertFalse(self.tg.sent)
+
+    def test_setprompt_replaces_existing_character_lore(self):
+        self.tg.admin = True
+        self.store.chat['personality'] = {'lore': 'Old identity', 'style': 'Short', 'names': ['Армен']}
+        self.run_job('/setprompt A pirate')
+        self.assertEqual(self.store.chat['personality']['lore'], '')
+        self.assertEqual(self.store.chat['personality']['names'], ['Армен'])
+        self.run_job('/chat Who are you?')
+        self.assertIn('A pirate', self.model.calls[-1][0])
+        self.assertNotIn('Old identity', self.model.calls[-1][0])
+
+    def test_status_reports_startup_privacy_and_incidental_cooldown(self):
+        self.tg.admin = True
+        self.service.privacy_enabled = True
+        self.run_job('/status')
+        self.assertIn('BotFather privacy (at startup): enabled', self.tg.sent[-1])
+        self.assertIn('incidental reply cooldown: 10s', self.tg.sent[-1])
+        self.assertFalse(self.model.calls)
