@@ -19,6 +19,26 @@ def stop(*_):
     STOP = True
 
 
+class ChatScheduler:
+    def __init__(self, executor, limit, work):
+        self.executor, self.limit, self.work = executor, limit, work
+        self.active, self.last_scheduled = {}, {}
+        self.turn = 0
+
+    def tick(self, chats):
+        for chat_id, future in list(self.active.items()):
+            if future.done():
+                future.result()
+                del self.active[chat_id]
+        for chat_id in sorted(chats, key=lambda chat: self.last_scheduled.get(chat, -1)):
+            if len(self.active) >= self.limit:
+                break
+            if chat_id not in self.active:
+                self.active[chat_id] = self.executor.submit(self.work, chat_id)
+                self.last_scheduled[chat_id] = self.turn
+                self.turn += 1
+
+
 def work_chat(config, chat_id, identity, pacer):
     store = Store(config.history_limit, retention_days=config.memory_retention_days, worker=True)
     telegram = TelegramAPI(config.telegram_token)
@@ -57,18 +77,11 @@ def main():
         stage = 'running'
         event('bot_started', provider=config.provider, model=config.model, budget_usd=config.budget)
         pacer = RequestPacer(config.api_min_interval_seconds)
-        active = {}
         with ThreadPoolExecutor(max_workers=config.worker_count, thread_name_prefix='chat-worker') as workers:
+            scheduler = ChatScheduler(workers, config.worker_count,
+                lambda chat_id: work_chat(config, chat_id, identity, pacer))
             while not STOP:
-                for chat_id, future in list(active.items()):
-                    if future.done():
-                        future.result()
-                        del active[chat_id]
-                for chat_id in store.runnable_chats():
-                    if len(active) >= config.worker_count:
-                        break
-                    if chat_id not in active:
-                        active[chat_id] = workers.submit(work_chat, config, chat_id, identity, pacer)
+                scheduler.tick(store.runnable_chats())
                 try:
                     updates = telegram.call('getUpdates', offset=store.checkpoint(), limit=100,
                         timeout=1, allowed_updates=['message'])

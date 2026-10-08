@@ -109,6 +109,36 @@ class PostgresTests(unittest.TestCase):
         self.store.state(-1)
         self.store.mark_check(-1)
         self.assertTrue(self.store.cooling_down(-1, 10))
+
+    def test_job_lock_excludes_a_second_connection(self):
+        other = psycopg.connect('host=db dbname=roleplay user=roleplay password=test-only-password', autocommit=True, row_factory=dict_row)
+        worker = Store(50, other, worker=True)
+        try:
+            with self.store.job_lock(100) as acquired:
+                self.assertTrue(acquired)
+                with worker.job_lock(100) as second:
+                    self.assertFalse(second)
+            with worker.job_lock(100) as acquired:
+                self.assertTrue(acquired)
+        finally:
+            other.close()
+
+    def test_help_and_pause_are_delivered_while_older_ai_job_is_prepared(self):
+        from test_service import payload, FakeTelegram, FakeModel
+        from config import Config
+        from service import Service
+        telegram = FakeTelegram(admin=True)
+        service = Service(Config('synthetic', 'synthetic', frozenset({-1})), self.store, telegram, FakeModel())
+        service.accept(1, payload())
+        service.process_one()
+        self.assertEqual(self.store.job(1)['phase'], 'prepared')
+        service.accept(2, payload('/help'))
+        self.assertTrue(telegram.sent)
+        service.accept(3, payload('/pause'))
+        self.assertTrue(self.store.state(-1)['paused'])
+        self.assertIsNone(self.store.job(3))
+        service.process_one()
+        self.assertIsNone(self.store.job(1))
     def test_application_role_is_not_administrator(self):
         role=self.conn.execute('SELECT rolsuper,rolcreaterole FROM pg_roles WHERE rolname=current_user').fetchone()
         self.assertFalse(role['rolsuper'])

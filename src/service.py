@@ -126,6 +126,8 @@ class Service:
             self.store.save_summary(chat_id, summary, remove[-1]['id'])
 
     def accept(self, update_id, payload):
+        if hasattr(self.store, 'checkpoint') and update_id < self.store.checkpoint():
+            return
         if payload and payload['chat_id'] not in self.config.chats:
             payload = None
         if payload:
@@ -143,6 +145,19 @@ class Service:
                 command = '/personality'
             if not command and (state['paused'] or (state['mode'] == 'directed' and not payload['directed'])):
                 payload = None
+            if command in {'/help', '/whoami', '/status', '/pause', '/resume'} and hasattr(self.store, 'job_lock') and not self.store.worker:
+                # These controls do not rewrite conversation memory. Process
+                # them in the poller even when every AI worker is occupied.
+                with self.store.job_lock(update_id) as acquired:
+                    if not acquired:
+                        return
+                    self.store.enqueue(update_id, payload)
+                    with self.store.memory_scope(payload.get('thread_id')):
+                        job = self.store.job(update_id)
+                        if job:
+                            self.command(job)
+                            self.deliver(self.store.job(update_id))
+                return
             if command in {'/pause', '/resume'} and self.can_manage(payload):
                 # Polling must be able to stop admission while a worker is
                 # waiting for a provider. Other settings retain chat ordering.
@@ -424,9 +439,13 @@ class Service:
             return None
         scope = getattr(self.store, 'memory_scope', None)
         spending = getattr(self.store, 'spending_scope', None)
+        lock = getattr(self.store, 'job_lock', None)
         budget = self.config.chat_budget or self.config.budget / len(self.config.chats)
-        with scope(job['payload'].get('thread_id')) if scope else nullcontext(), spending(job['payload']['chat_id'], budget) if spending else nullcontext():
-            return self.process_job(job)
+        with lock(job['update_id']) if lock else nullcontext(True) as acquired:
+            if not acquired:
+                return None
+            with scope(job['payload'].get('thread_id')) if scope else nullcontext(), spending(job['payload']['chat_id'], budget) if spending else nullcontext():
+                return self.process_job(job)
 
     def process_job(self, job):
         if job['payload']['chat_id'] not in self.config.chats:

@@ -104,6 +104,7 @@ class Store:
         self.thread_id = 0
         self.budget_chat = None
         self.chat_budget = None
+        self.worker = worker
         self.conn = conn or psycopg.connect(autocommit=True, row_factory=dict_row)
         if not worker:
             if not self.conn.execute('SELECT pg_try_advisory_lock(781235689)').fetchone()['pg_try_advisory_lock']:
@@ -136,6 +137,19 @@ class Store:
             yield
         finally:
             self.budget_chat, self.chat_budget = previous
+
+    @contextmanager
+    def job_lock(self, update_id):
+        key = 'telegram-job:' + str(update_id)
+        acquired = self.conn.execute('SELECT pg_try_advisory_lock(hashtextextended(%s,0)) AS acquired', (key,)).fetchone()['acquired']
+        try:
+            yield acquired
+        finally:
+            if acquired:
+                self.conn.execute('SELECT pg_advisory_unlock(hashtextextended(%s,0))', (key,))
+
+    def job(self, update_id):
+        return self.conn.execute('SELECT * FROM jobs WHERE update_id=%s', (update_id,)).fetchone()
 
     def admit(self, job, user_limit=6, chat_limit=30, media_limit=3):
         if job.get('admitted'):
