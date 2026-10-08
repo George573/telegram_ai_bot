@@ -4,17 +4,15 @@ import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-SCHEMA = '''
+# Versions 1–4 adopt the legacy additive schema. New versions run exactly
+# once, in order, in the same transaction as their version record.
+MIGRATIONS = (
+    """
 CREATE TABLE IF NOT EXISTS chats (
  id BIGINT PRIMARY KEY, persona TEXT NOT NULL DEFAULT 'You are a playful family cat.',
  mode TEXT NOT NULL DEFAULT 'directed', paused BOOLEAN NOT NULL DEFAULT FALSE,
  history_limit INTEGER NOT NULL, summary TEXT NOT NULL DEFAULT '');
 ALTER TABLE chats ADD COLUMN IF NOT EXISTS last_reply TIMESTAMPTZ;
-ALTER TABLE chats ADD COLUMN IF NOT EXISTS personality JSONB NOT NULL DEFAULT '{}'::jsonb;
-ALTER TABLE chats ADD COLUMN IF NOT EXISTS images_enabled BOOLEAN NOT NULL DEFAULT TRUE;
-ALTER TABLE chats ADD COLUMN IF NOT EXISTS voice_enabled BOOLEAN NOT NULL DEFAULT TRUE;
-ALTER TABLE chats ADD COLUMN IF NOT EXISTS web_enabled BOOLEAN NOT NULL DEFAULT FALSE;
-ALTER TABLE chats ALTER COLUMN web_enabled SET DEFAULT FALSE;
 CREATE TABLE IF NOT EXISTS messages (
  id BIGSERIAL PRIMARY KEY, chat_id BIGINT NOT NULL REFERENCES chats(id),
  role TEXT NOT NULL, content TEXT NOT NULL);
@@ -23,23 +21,44 @@ CREATE TABLE IF NOT EXISTS runtime (
  id INTEGER PRIMARY KEY CHECK(id=1), next_update BIGINT NOT NULL DEFAULT 0,
  spent NUMERIC(14,8) NOT NULL DEFAULT 0);
 INSERT INTO runtime(id) VALUES(1) ON CONFLICT DO NOTHING;
-ALTER TABLE runtime ADD COLUMN IF NOT EXISTS last_update_at TIMESTAMPTZ NOT NULL DEFAULT now();
 CREATE TABLE IF NOT EXISTS jobs (
  update_id BIGINT PRIMARY KEY, payload JSONB NOT NULL,
  phase TEXT NOT NULL DEFAULT 'queued', answer TEXT, assistant BOOLEAN NOT NULL DEFAULT FALSE);
-ALTER TABLE jobs ADD COLUMN IF NOT EXISTS delivery_attempts INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE jobs ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();
-ALTER TABLE jobs ADD COLUMN IF NOT EXISTS next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now();
+""",
+    """
+ALTER TABLE chats ADD COLUMN IF NOT EXISTS personality JSONB NOT NULL DEFAULT '{}'::jsonb;
 CREATE TABLE IF NOT EXISTS personality_drafts (
  chat_id BIGINT NOT NULL REFERENCES chats(id), user_id BIGINT NOT NULL,
  settings JSONB, expires_at TIMESTAMPTZ NOT NULL,
  PRIMARY KEY(chat_id,user_id));
-CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY);
-INSERT INTO schema_version VALUES(1) ON CONFLICT DO NOTHING;
-INSERT INTO schema_version VALUES(2) ON CONFLICT DO NOTHING;
-INSERT INTO schema_version VALUES(3) ON CONFLICT DO NOTHING;
-INSERT INTO schema_version VALUES(4) ON CONFLICT DO NOTHING;
-'''
+""",
+    """
+ALTER TABLE chats ADD COLUMN IF NOT EXISTS images_enabled BOOLEAN NOT NULL DEFAULT TRUE;
+ALTER TABLE chats ADD COLUMN IF NOT EXISTS voice_enabled BOOLEAN NOT NULL DEFAULT TRUE;
+""",
+    "ALTER TABLE chats ADD COLUMN IF NOT EXISTS web_enabled BOOLEAN NOT NULL DEFAULT FALSE;",
+    """
+ALTER TABLE chats ALTER COLUMN web_enabled SET DEFAULT FALSE;
+ALTER TABLE runtime ADD COLUMN IF NOT EXISTS last_update_at TIMESTAMPTZ NOT NULL DEFAULT now();
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS delivery_attempts INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now();
+""",
+)
+
+
+def migrate(conn):
+    with conn.transaction():
+        conn.execute('CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY)')
+        versions = [row['version'] for row in conn.execute('SELECT version FROM schema_version ORDER BY version').fetchall()]
+        if versions and (versions != list(range(1, max(versions) + 1)) or max(versions) > len(MIGRATIONS)):
+            raise RuntimeError('Unsupported database schema version')
+        current = max(versions, default=0)
+        for version, sql in enumerate(MIGRATIONS, 1):
+            if version > current:
+                conn.execute(sql)
+                conn.execute('INSERT INTO schema_version(version) VALUES(%s)', (version,))
+
 
 
 class Store:
@@ -48,8 +67,7 @@ class Store:
         self.conn = conn or psycopg.connect(autocommit=True, row_factory=dict_row)
         if not self.conn.execute('SELECT pg_try_advisory_lock(781235689)').fetchone()['pg_try_advisory_lock']:
             raise RuntimeError('Another bot instance is already using this database')
-        with self.conn.transaction():
-            self.conn.execute(SCHEMA)
+        migrate(self.conn)
 
     @contextmanager
     def transaction(self):

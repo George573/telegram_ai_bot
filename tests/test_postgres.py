@@ -73,6 +73,7 @@ class PostgresTests(unittest.TestCase):
         self.store.state(-1)
         self.store.append(-1, 'user', 'Existing memory')
         self.conn.execute('ALTER TABLE chats DROP COLUMN personality')
+        self.conn.execute('DELETE FROM schema_version WHERE version >= 2')
         self.store = Store(50, self.conn)
         self.assertEqual(self.store.state(-1)['personality'], {})
         self.assertEqual(self.store.messages(-1)[0]['content'], 'Existing memory')
@@ -107,3 +108,22 @@ class PostgresTests(unittest.TestCase):
         self.assertFalse(self.store.state(-1)['images_enabled'])
         self.assertIsNone(self.store.next_job()['payload']['media'])
         self.assertNotIn('file_id', str(self.store.next_job()['payload']))
+
+    def test_newer_schema_is_rejected_without_changing_state(self):
+        from storage import MIGRATIONS
+        newer = len(MIGRATIONS) + 1
+        self.conn.execute('INSERT INTO schema_version VALUES(%s)', (newer,))
+        try:
+            with self.assertRaises(RuntimeError):
+                Store(50, self.conn)
+        finally:
+            self.conn.execute('DELETE FROM schema_version WHERE version=%s', (newer,))
+
+    def test_failed_migration_does_not_record_version(self):
+        from unittest.mock import patch
+        from storage import MIGRATIONS, migrate
+        version = len(MIGRATIONS) + 1
+        with patch('storage.MIGRATIONS', MIGRATIONS + ('SELECT deliberately_missing_function()',)):
+            with self.assertRaises(psycopg.Error):
+                migrate(self.conn)
+        self.assertIsNone(self.conn.execute('SELECT version FROM schema_version WHERE version=%s', (version,)).fetchone())
