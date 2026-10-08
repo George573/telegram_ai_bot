@@ -31,6 +31,7 @@ class Config:
     chat_requests_per_minute: int = 30
     user_media_per_minute: int = 3
     chat_budget: Decimal = Decimal('0')
+    worker_count: int = 2
 
     @classmethod
     def load(cls):
@@ -50,6 +51,7 @@ class Config:
             chat_requests_per_minute=int(os.getenv('CHAT_REQUESTS_PER_MINUTE', '30')),
             user_media_per_minute=int(os.getenv('USER_MEDIA_PER_MINUTE', '3')),
             chat_budget=Decimal(os.getenv('CHAT_BUDGET_USD', '0')),
+            worker_count=int(os.getenv('WORKER_COUNT', '2')),
             provider=provider, zai_key=zai_key,
             api_min_interval_seconds=float(os.getenv('API_MIN_INTERVAL_SECONDS', '0.25')),
             zai_vision_model=os.getenv('ZAI_VISION_MODEL', 'glm-4.6v') if provider == 'zai' else 'glm-4.6v',
@@ -69,6 +71,8 @@ class Config:
             raise ValueError('Request limits must be between 1 and 1000')
         if not config.chat_budget.is_finite() or config.chat_budget < 0:
             raise ValueError('Invalid per-chat budget')
+        if not 1 <= config.worker_count <= 8:
+            raise ValueError('Worker count must be between 1 and 8')
         if not 1024 <= config.media_max_bytes <= 10 * 1024 * 1024 or not 1 <= config.voice_max_seconds <= 300:
             raise ValueError('Invalid media limits')
         if any(x <= 0 for x in config.superadmin_ids):

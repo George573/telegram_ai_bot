@@ -4,6 +4,7 @@ import logging
 import time
 import random
 import re
+import threading
 from observability import event
 from providers import (PRICES as PROVIDER_PRICES, WEB_CALL_COST, TRANSCRIPTION_PER_MINUTE,
                        create_provider, citation_sources, model_prices, TRANSCRIPTION_RATES,
@@ -28,6 +29,21 @@ class ModelText(str):
 
 class ModelFailure(Exception):
     pass
+
+
+class RequestPacer:
+    """Shared start-rate limit; independent requests may run concurrently."""
+    def __init__(self, interval):
+        self.interval = interval
+        self.lock = threading.Lock()
+        self.next_start = 0.0
+
+    def wait(self):
+        with self.lock:
+            delay = max(0, self.next_start - time.monotonic())
+            if delay:
+                time.sleep(delay)
+            self.next_start = time.monotonic() + self.interval
 
 
 class DecisionValidationError(ValueError):
@@ -105,10 +121,11 @@ def estimate_cost(model, instructions, history, output_limit, provider='openai')
 
 
 class Model:
-    def __init__(self, config, store, client=None):
+    def __init__(self, config, store, client=None, pacer=None):
         self.config, self.store = config, store
         self.provider = create_provider(config, client)
         self.last_request_finished = None
+        self.pacer = pacer
 
     def reserve(self, amount):
         try:
@@ -119,6 +136,9 @@ class Model:
             raise
 
     def paced_call(self, call, model, operation):
+        if self.pacer is not None:
+            self.pacer.wait()
+            return call()
         if self.last_request_finished is not None:
             delay = self.last_request_finished + self.config.api_min_interval_seconds - time.monotonic()
             if delay > 0:

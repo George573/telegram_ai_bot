@@ -98,16 +98,21 @@ def migrate(conn):
 
 
 class Store:
-    def __init__(self, default_limit, conn=None, retention_days=30):
+    def __init__(self, default_limit, conn=None, retention_days=30, worker=False):
         self.default_limit = default_limit
         self.retention_days = retention_days
         self.thread_id = 0
         self.budget_chat = None
         self.chat_budget = None
         self.conn = conn or psycopg.connect(autocommit=True, row_factory=dict_row)
-        if not self.conn.execute('SELECT pg_try_advisory_lock(781235689)').fetchone()['pg_try_advisory_lock']:
-            raise RuntimeError('Another bot instance is already using this database')
-        migrate(self.conn)
+        if not worker:
+            if not self.conn.execute('SELECT pg_try_advisory_lock(781235689)').fetchone()['pg_try_advisory_lock']:
+                raise RuntimeError('Another bot instance is already using this database')
+            migrate(self.conn)
+        else:
+            version = self.conn.execute('SELECT max(version) AS version FROM schema_version').fetchone()['version']
+            if version != len(MIGRATIONS):
+                raise RuntimeError('Worker database schema is incompatible')
 
     @contextmanager
     def transaction(self):
@@ -230,13 +235,20 @@ class Store:
                 self.conn.execute('INSERT INTO jobs(update_id,payload) VALUES(%s,%s) ON CONFLICT DO NOTHING', (update_id,Jsonb(payload)))
             self.conn.execute('UPDATE runtime SET next_update=%s,last_update_at=now() WHERE id=1', (update_id + 1,))
 
-    def next_job(self):
+    def next_job(self, chat_id=None):
         self.conn.execute("DELETE FROM jobs WHERE created_at < now()-interval '24 hours'")
         return self.conn.execute('''SELECT j.* FROM jobs j
-            WHERE j.next_attempt_at <= now() AND NOT EXISTS (
+            WHERE j.next_attempt_at <= now() AND (%s::bigint IS NULL OR j.payload->>'chat_id'=%s)
+            AND NOT EXISTS (
                 SELECT 1 FROM jobs older WHERE older.payload->>'chat_id'=j.payload->>'chat_id'
                 AND older.update_id < j.update_id)
-            ORDER BY j.update_id LIMIT 1''').fetchone()
+            ORDER BY j.update_id LIMIT 1''', (chat_id,str(chat_id) if chat_id is not None else None)).fetchone()
+
+    def runnable_chats(self):
+        return [row['chat_id'] for row in self.conn.execute('''SELECT DISTINCT (j.payload->>'chat_id')::bigint AS chat_id
+            FROM jobs j WHERE j.next_attempt_at<=now() AND j.created_at>=now()-interval '24 hours'
+            AND NOT EXISTS (SELECT 1 FROM jobs older WHERE older.payload->>'chat_id'=j.payload->>'chat_id'
+                AND older.update_id<j.update_id) ORDER BY chat_id''').fetchall()]
 
     def retry_delivery(self, job, seconds):
         # Rejection is known, so scheduling another attempt is safe. Unknown

@@ -1,10 +1,11 @@
-"""Sequential, durable Telegram polling. Never print secrets or raw exceptions."""
+"""Independent polling with bounded, ordered workers. Never print exceptions."""
 import signal
 import time
 from observability import configure_logging, event
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from config import Config
-from model import Model
+from model import Model, RequestPacer
 from policy import normalize
 from service import Service
 from storage import Store
@@ -16,6 +17,23 @@ STOP = False
 def stop(*_):
     global STOP
     STOP = True
+
+
+def work_chat(config, chat_id, identity, pacer):
+    store = Store(config.history_limit, retention_days=config.memory_retention_days, worker=True)
+    telegram = TelegramAPI(config.telegram_token)
+    model = Model(config, store, pacer=pacer)
+    try:
+        service = Service(config, store, telegram, model,
+                          privacy_enabled=not identity.get('can_read_all_group_messages', False))
+        # Yield between turns so a busy group cannot monopolize a worker.
+        for _ in range(8):
+            if STOP or service.process_one(chat_id) is None:
+                break
+    finally:
+        store.conn.close()
+        telegram._http.close()
+        model.provider.client.close()
 
 
 def main():
@@ -38,24 +56,35 @@ def main():
                           privacy_enabled=not identity.get('can_read_all_group_messages', False))
         stage = 'running'
         event('bot_started', provider=config.provider, model=config.model, budget_usd=config.budget)
-        while not STOP:
-            delay = service.process_one()
-            if delay is not None:
-                if delay:
-                    time.sleep(delay)
-                continue
-            try:
-                updates = telegram.call('getUpdates', offset=store.checkpoint(), limit=1,
-                    timeout=25, allowed_updates=['message'])
-                for update in updates:
-                    payload = normalize(update, config.chats, identity)
-                    service.accept(update['update_id'], payload)
-            except TelegramFailure as error:
-                if error.code in {401, 409}:
-                    event('bot_stopped', level=logging.ERROR, reason='telegram_access', status_code=error.code)
-                    return 1
-                event('poll_failed', level=logging.WARNING, status_code=error.code, retry_after=error.retry_after)
-                time.sleep(max(3, min(error.retry_after or 3, 60)))
+        pacer = RequestPacer(config.api_min_interval_seconds)
+        active = {}
+        with ThreadPoolExecutor(max_workers=config.worker_count, thread_name_prefix='chat-worker') as workers:
+            while not STOP:
+                for chat_id, future in list(active.items()):
+                    if future.done():
+                        future.result()
+                        del active[chat_id]
+                for chat_id in store.runnable_chats():
+                    if len(active) >= config.worker_count:
+                        break
+                    if chat_id not in active:
+                        active[chat_id] = workers.submit(work_chat, config, chat_id, identity, pacer)
+                try:
+                    updates = telegram.call('getUpdates', offset=store.checkpoint(), limit=100,
+                        timeout=1, allowed_updates=['message'])
+                    for update in updates:
+                        payload = normalize(update, config.chats, identity)
+                        service.accept(update['update_id'], payload)
+                except TelegramFailure as error:
+                    if error.code in {401, 409}:
+                        event('bot_stopped', level=logging.ERROR, reason='telegram_access', status_code=error.code)
+                        stop()
+                        return 1
+                    event('poll_failed', level=logging.WARNING, status_code=error.code, retry_after=error.retry_after)
+                    # Honor the full server delay, but keep shutdown responsive.
+                    deadline = time.monotonic() + max(3, error.retry_after or 3)
+                    while not STOP and time.monotonic() < deadline:
+                        time.sleep(min(1, max(0, deadline-time.monotonic())))
         event('bot_stopped', reason='shutdown')
         return 0
     except Exception:

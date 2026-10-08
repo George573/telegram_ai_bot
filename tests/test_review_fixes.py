@@ -67,3 +67,17 @@ class ReviewFixTests(unittest.TestCase):
         service.process_one()
         service.process_one()
         self.assertFalse(calls[-1]['allow_search'])
+
+    def test_pause_takes_effect_before_previous_reply_finishes(self):
+        service = self.setup_service()
+        self.telegram.admin = True
+        service.accept(1, payload())
+        service.process_one()
+        def generating(*args, **kwargs):
+            service.accept(2, payload('/pause'))
+            return 'Late reply'
+        self.model.generate = generating
+        service.process_one()
+        self.assertTrue(self.store.chat['paused'])
+        self.assertNotIn('Late reply', [job['answer'] for job in self.store.jobs])
+        self.assertFalse(self.telegram.sent)
