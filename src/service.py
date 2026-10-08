@@ -351,10 +351,10 @@ class Service:
         except TelegramFailure as error:
             event('delivery_failed', level=logging.WARNING, update_id=job['update_id'],
                   status_code=error.code, retry_after=error.retry_after)
-            if error.code == 429:
+            if error.code == 429 and job.get('delivery_attempts', 0) < 5:
                 # Explicit rate-limit rejection means Telegram did not accept the message.
-                self.store.phase(job['update_id'], 'generated', job['answer'], job['assistant'])
-                return max(1, min(error.retry_after, 60))
+                self.store.retry_delivery(job, max(1, error.retry_after))
+                return 0
             self.store.finish(job['update_id'])
             return 0
         event('reply_delivered', update_id=job['update_id'])

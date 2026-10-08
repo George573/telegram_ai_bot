@@ -43,6 +43,12 @@ class MemoryStore:
                 job.update(phase=phase, answer=answer, assistant=assistant)
     def finish(self, update): self.jobs = [j for j in self.jobs if j['update_id'] != update]
     def next_job(self): return deepcopy(self.jobs[0]) if self.jobs else None
+    def retry_delivery(self, job, seconds):
+        self.phase(job['update_id'], 'generated', job['answer'], job['assistant'])
+        for item in self.jobs:
+            if item['update_id'] == job['update_id']:
+                item['delivery_attempts'] = item.get('delivery_attempts', 0) + 1
+                item['retry_seconds'] = seconds
     def enqueue(self, update, payload):
         if payload: self.jobs.append(dict(update_id=update, payload=deepcopy(payload), phase='queued', answer=None, assistant=False))
 

@@ -25,6 +25,9 @@ INSERT INTO runtime(id) VALUES(1) ON CONFLICT DO NOTHING;
 CREATE TABLE IF NOT EXISTS jobs (
  update_id BIGINT PRIMARY KEY, payload JSONB NOT NULL,
  phase TEXT NOT NULL DEFAULT 'queued', answer TEXT, assistant BOOLEAN NOT NULL DEFAULT FALSE);
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS delivery_attempts INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now();
 CREATE TABLE IF NOT EXISTS personality_drafts (
  chat_id BIGINT NOT NULL REFERENCES chats(id), user_id BIGINT NOT NULL,
  settings JSONB, expires_at TIMESTAMPTZ NOT NULL,
@@ -88,7 +91,19 @@ class Store:
             self.conn.execute('UPDATE runtime SET next_update=%s WHERE id=1', (update_id + 1,))
 
     def next_job(self):
-        return self.conn.execute('SELECT * FROM jobs ORDER BY update_id LIMIT 1').fetchone()
+        return self.conn.execute('''SELECT j.* FROM jobs j
+            WHERE j.next_attempt_at <= now() AND NOT EXISTS (
+                SELECT 1 FROM jobs older WHERE older.payload->>'chat_id'=j.payload->>'chat_id'
+                AND older.update_id < j.update_id)
+            ORDER BY j.update_id LIMIT 1''').fetchone()
+
+    def retry_delivery(self, job, seconds):
+        # Rejection is known, so scheduling another attempt is safe. Unknown
+        # sends retain the separate sending recovery behavior.
+        self.conn.execute('''UPDATE jobs SET phase='generated',
+            delivery_attempts=delivery_attempts+1,
+            next_attempt_at=now()+%s * interval '1 second' WHERE update_id=%s''',
+            (max(1, seconds), job['update_id']))
 
     def phase(self, update_id, phase, answer=None, assistant=False):
         self.conn.execute('UPDATE jobs SET phase=%s,answer=%s,assistant=%s WHERE update_id=%s', (phase,answer,assistant,update_id))
