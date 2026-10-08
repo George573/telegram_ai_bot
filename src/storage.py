@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS runtime (
  id INTEGER PRIMARY KEY CHECK(id=1), next_update BIGINT NOT NULL DEFAULT 0,
  spent NUMERIC(14,8) NOT NULL DEFAULT 0);
 INSERT INTO runtime(id) VALUES(1) ON CONFLICT DO NOTHING;
+ALTER TABLE runtime ADD COLUMN IF NOT EXISTS last_update_at TIMESTAMPTZ NOT NULL DEFAULT now();
 CREATE TABLE IF NOT EXISTS jobs (
  update_id BIGINT PRIMARY KEY, payload JSONB NOT NULL,
  phase TEXT NOT NULL DEFAULT 'queued', answer TEXT, assistant BOOLEAN NOT NULL DEFAULT FALSE);
@@ -80,6 +81,10 @@ class Store:
         self.conn.execute('DELETE FROM messages WHERE chat_id=%s AND id<=%s', (chat_id,through_id))
 
     def checkpoint(self):
+        # After a week without updates Telegram can choose a lower random ID.
+        # Its remote queue expires after 24 hours, so the old cursor is no
+        # longer useful. Keep durable local jobs; reset only the polling cursor.
+        self.conn.execute("UPDATE runtime SET next_update=0 WHERE id=1 AND last_update_at < now()-interval '7 days'")
         return self.conn.execute('SELECT next_update FROM runtime WHERE id=1').fetchone()['next_update']
 
     def enqueue(self, update_id, payload):
@@ -88,7 +93,7 @@ class Store:
                 return
             if payload:
                 self.conn.execute('INSERT INTO jobs(update_id,payload) VALUES(%s,%s) ON CONFLICT DO NOTHING', (update_id,Jsonb(payload)))
-            self.conn.execute('UPDATE runtime SET next_update=%s WHERE id=1', (update_id + 1,))
+            self.conn.execute('UPDATE runtime SET next_update=%s,last_update_at=now() WHERE id=1', (update_id + 1,))
 
     def next_job(self):
         return self.conn.execute('''SELECT j.* FROM jobs j

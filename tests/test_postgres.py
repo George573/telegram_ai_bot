@@ -25,6 +25,14 @@ class PostgresTests(unittest.TestCase):
         self.store.enqueue(10,dict(chat_id=-1))
         self.assertEqual(self.store.checkpoint(),11)
         self.assertEqual(self.conn.execute('SELECT count(*) AS n FROM jobs').fetchone()['n'],1)
+
+    def test_lower_update_id_after_week_of_inactivity(self):
+        self.store.enqueue(10000, {'chat_id': -1})
+        self.conn.execute("UPDATE runtime SET last_update_at=now()-interval '8 days'")
+        self.assertEqual(self.store.checkpoint(), 0)
+        self.store.enqueue(12, {'chat_id': -2})
+        self.assertEqual(self.store.checkpoint(), 13)
+        self.assertEqual(self.conn.execute('SELECT count(*) AS n FROM jobs').fetchone()['n'], 2)
     def test_state_and_queued_work_survive_reconnect(self):
         self.store.state(-1)
         self.store.setting(-1,'persona','Persistent cat')
