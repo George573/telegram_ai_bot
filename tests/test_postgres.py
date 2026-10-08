@@ -49,6 +49,23 @@ class PostgresTests(unittest.TestCase):
             self.assertEqual(self.store.state(-1)['summary'], '')
             self.assertEqual(self.store.messages(-1)[0]['content'], 'Topic 8')
             self.assertFalse(self.store.cooling_down(-1, 30))
+
+    def test_reducing_history_limit_compacts_every_topic_before_setting(self):
+        from test_service import payload, FakeTelegram, FakeModel
+        from config import Config
+        from service import Service
+        for topic in (7, 8):
+            with self.store.memory_scope(topic):
+                self.store.state(-1)
+                for _ in range(15):
+                    self.store.append(-1, 'user', 'Synthetic conversation')
+        service = Service(Config('synthetic', 'synthetic', frozenset({-1})), self.store, FakeTelegram(admin=True), FakeModel())
+        service.accept(1, payload('/historylimit 10'))
+        service.process_one()
+        self.assertEqual(self.store.state(-1)['history_limit'], 10)
+        for topic in (7, 8):
+            with self.store.memory_scope(topic):
+                self.assertLessEqual(len(self.store.messages(-1)), 10)
     def test_state_and_queued_work_survive_reconnect(self):
         self.store.state(-1)
         self.store.setting(-1,'persona','Persistent cat')

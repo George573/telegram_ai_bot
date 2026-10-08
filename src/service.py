@@ -248,7 +248,12 @@ class Service:
             elif command == '/historylimit':
                 field, value = 'history_limit', valid_limit(argument)
                 # Complete compaction before changing limit. Failure leaves the setting unchanged.
-                self.compact(chat_id, limit=value, payload=payload)
+                if hasattr(self.store, 'topic_ids'):
+                    for topic_id in self.store.topic_ids(chat_id):
+                        with self.store.memory_scope(topic_id):
+                            self.compact(chat_id, limit=value, payload=payload)
+                else:
+                    self.compact(chat_id, limit=value, payload=payload)
             elif command == '/resetmemory':
                 clear = True
             elif command in {'/pause', '/resume'}:

@@ -191,6 +191,9 @@ class Store:
     def messages(self, chat_id):
         return self.conn.execute('SELECT id,role,content FROM messages WHERE chat_id=%s AND thread_id=%s ORDER BY id', (chat_id,self.thread_id)).fetchall()
 
+    def topic_ids(self, chat_id):
+        return [row['thread_id'] for row in self.conn.execute('SELECT thread_id FROM conversations WHERE chat_id=%s ORDER BY thread_id', (chat_id,)).fetchall()]
+
     def append(self, chat_id, role, content, sender_id=None, message_id=None):
         self.conn.execute('''INSERT INTO messages(chat_id,thread_id,role,content,sender_id,telegram_message_id)
             VALUES(%s,%s,%s,%s,%s,%s)''', (chat_id,self.thread_id,role,content,sender_id,message_id))
