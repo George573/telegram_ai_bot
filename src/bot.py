@@ -1,7 +1,8 @@
 """Sequential, durable Telegram polling. Never print secrets or raw exceptions."""
-import logging
 import signal
 import time
+from observability import configure_logging, event
+import logging
 from config import Config
 from model import Model
 from policy import normalize
@@ -9,7 +10,6 @@ from service import Service
 from storage import Store
 from telegram_api import TelegramAPI, TelegramFailure
 
-logging.disable(logging.CRITICAL)
 STOP = False
 
 
@@ -19,16 +19,22 @@ def stop(*_):
 
 
 def main():
+    configure_logging()
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
+    stage = 'configuration'
     try:
         config = Config.load()
+        stage = 'database'
         store = Store(config.history_limit)
+        stage = 'telegram'
         telegram = TelegramAPI(config.telegram_token)
         identity = telegram.call('getMe')
+        stage = 'provider'
         service = Service(config, store, telegram, Model(config, store),
                           privacy_enabled=not identity.get('can_read_all_group_messages', False))
-        print('Bot started; local persistent storage ready.', flush=True)
+        stage = 'running'
+        event('bot_started', provider=config.provider, model=config.model, budget_usd=config.budget)
         while not STOP:
             delay = service.process_one()
             if delay is not None:
@@ -43,13 +49,14 @@ def main():
                     service.accept(update['update_id'], payload)
             except TelegramFailure as error:
                 if error.code in {401, 409}:
-                    print('Bot stopped: invalid Telegram access or another polling instance.', flush=True)
+                    event('bot_stopped', level=logging.ERROR, reason='telegram_access', status_code=error.code)
                     return 1
+                event('poll_failed', level=logging.WARNING, status_code=error.code, retry_after=error.retry_after)
                 time.sleep(max(3, min(error.retry_after or 3, 60)))
-        print('Bot stopped cleanly.', flush=True)
+        event('bot_stopped', reason='shutdown')
         return 0
     except Exception:
-        print('Bot stopped safely. Check local configuration, database connectivity, and model access; no secrets displayed.', flush=True)
+        event('bot_failed', level=logging.ERROR, stage=stage)
         return 1
 
 

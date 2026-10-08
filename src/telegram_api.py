@@ -1,4 +1,8 @@
 import re
+import threading
+import logging
+from contextlib import contextmanager
+from observability import event
 import httpx
 
 
@@ -50,6 +54,43 @@ class TelegramAPI:
             raise
         except Exception:
             raise TelegramFailure() from None
+
+    def send_typing(self, job):
+        params = {'chat_id': job['chat_id'], 'action': 'typing'}
+        if job.get('thread_id'):
+            params['message_thread_id'] = job['thread_id']
+        try:
+            response = self._http.post(self._base + 'sendChatAction', json=params, timeout=3)
+            if response.status_code != 200 or not response.json().get('ok'):
+                event('typing_failed', level=logging.WARNING, status_code=response.status_code)
+                return False
+            return True
+        except Exception:
+            event('typing_failed', level=logging.WARNING)
+            return False
+
+    @contextmanager
+    def typing(self, job):
+        stopped = threading.Event()
+        def refresh():
+            while not stopped.is_set():
+                if not self.send_typing(job):
+                    return
+                if stopped.wait(4):
+                    return
+        worker = threading.Thread(target=refresh, name='telegram-typing', daemon=True)
+        try:
+            worker.start()
+        except Exception:
+            event('typing_failed', level=logging.WARNING)
+            yield
+            return
+        try:
+            yield
+        finally:
+            stopped.set()
+            # A bounded HTTP call may still be in flight. Do not hold up delivery.
+            worker.join(timeout=0)
 
     def send(self, job, text):
         params = dict(chat_id=job['chat_id'], text=text,
