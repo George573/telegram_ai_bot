@@ -27,7 +27,7 @@ class MemoryStore:
             raise
     def state(self, _): return self.chat.copy()
     def messages(self, _): return deepcopy(self.rows)
-    def append(self, chat, role, content):
+    def append(self, chat, role, content, **metadata):
         self.rows.append(dict(id=self.next_id, role=role, content=content)); self.next_id += 1
     def clear(self, _): self.rows.clear(); self.chat['summary'] = ''
     def setting(self, chat, key, value): self.chat[key] = value

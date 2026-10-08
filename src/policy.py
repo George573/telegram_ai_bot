@@ -60,7 +60,7 @@ def normalize(update, allowed, bot):
         return None
     reply = message.get('reply_to_message', {}).get('from', {}).get('id') == bot['id']
     command, argument = command_parts(text, bot['username'])
-    if command and command not in ADMIN_COMMANDS | {'/help', '/whoami', '/chat', '/search'}:
+    if command and command not in ADMIN_COMMANDS | {'/help', '/whoami', '/chat', '/search', '/forgetme'}:
         return None
     if media and command and command != '/chat':
         return None

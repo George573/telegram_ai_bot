@@ -173,6 +173,13 @@ class Service:
     def command(self, job):
         payload = job['payload']
         chat_id, command, argument = payload['chat_id'], payload['command'], payload['argument'].strip()
+        if command == '/forgetme':
+            if payload['anonymous'] or not payload.get('user_id'):
+                self.queue_answer(job, 'Anonymous senders cannot be identified for deletion.')
+            else:
+                self.store.forget_user(chat_id, payload['user_id'], job['update_id'])
+                self.queue_answer(job, 'Your local messages and drafts were deleted. Group summaries and affected pending replies were cleared. Backups and provider copies are separate.')
+            return
         if command == '/whoami':
             self.queue_answer(job, 'Anonymous senders cannot be identified.' if payload['anonymous'] else
                               f"Your Telegram user ID: {payload['user_id']}")
@@ -286,7 +293,7 @@ class Service:
             else:
                 self.convert_media(job)
             return
-        if payload['command'] in ADMIN_COMMANDS | {'/help', '/whoami'}:
+        if payload['command'] in ADMIN_COMMANDS | {'/help', '/whoami', '/forgetme'}:
             self.command(job)
             return
         if state['paused'] or (state['mode'] == 'directed' and not payload['directed']):
@@ -314,7 +321,7 @@ class Service:
             self.compact(chat_id, slots=1 if cooling else 2, payload=payload)
             content = f"Speaker {payload.get('user_id') or 'anonymous'}: {payload['text']}"
             with self.store.transaction():
-                self.store.append(chat_id, 'user', content)
+                self.store.append(chat_id, 'user', content, sender_id=payload.get('user_id'), message_id=payload['message_id'])
                 if cooling:
                     # Keep all-mode context even when suppressing incidental replies.
                     self.store.finish(job['update_id'])

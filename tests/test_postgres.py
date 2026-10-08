@@ -86,13 +86,41 @@ class PostgresTests(unittest.TestCase):
         finally: other.close()
 
     def test_personality_migration_preserves_existing_chats(self):
+        from storage import MIGRATIONS
+        self.conn.execute('CREATE SCHEMA migration_fixture')
+        try:
+            self.conn.execute('SET search_path TO migration_fixture')
+            self.conn.execute(MIGRATIONS[0])
+            self.conn.execute('CREATE TABLE schema_version(version INTEGER PRIMARY KEY)')
+            self.conn.execute('INSERT INTO schema_version VALUES(1)')
+            self.conn.execute("INSERT INTO chats(id,history_limit,summary) VALUES(-1,50,'Legacy summary')")
+            self.conn.execute("INSERT INTO messages(chat_id,role,content) VALUES(-1,'user','Existing memory')")
+            upgraded = Store(50, self.conn)
+            self.assertEqual(upgraded.state(-1)['personality'], {})
+            self.assertEqual(upgraded.state(-1)['summary'], 'Legacy summary')
+            self.assertEqual(upgraded.messages(-1)[0]['content'], 'Existing memory')
+        finally:
+            self.conn.execute('SET search_path TO public')
+            self.conn.execute('DROP SCHEMA migration_fixture CASCADE')
+
+    def test_expiry_clears_old_summary_and_messages(self):
         self.store.state(-1)
-        self.store.append(-1, 'user', 'Existing memory')
-        self.conn.execute('ALTER TABLE chats DROP COLUMN personality')
-        self.conn.execute('DELETE FROM schema_version WHERE version >= 2')
-        self.store = Store(50, self.conn)
-        self.assertEqual(self.store.state(-1)['personality'], {})
-        self.assertEqual(self.store.messages(-1)[0]['content'], 'Existing memory')
+        self.store.append(-1, 'user', 'Old data', sender_id=10, message_id=20)
+        self.conn.execute("UPDATE messages SET created_at=now()-interval '31 days'")
+        self.conn.execute("UPDATE conversations SET summary='Old summary',summary_started_at=now()-interval '31 days'")
+        self.assertEqual(self.store.state(-1)['summary'], '')
+        self.assertFalse(self.store.messages(-1))
+
+    def test_forget_user_clears_derived_data_but_preserves_other_senders(self):
+        self.store.state(-1)
+        self.store.append(-1, 'user', 'Delete me', sender_id=10, message_id=20)
+        self.store.append(-1, 'user', 'Keep me', sender_id=11, message_id=21)
+        self.store.save_summary(-1, 'Derived data', 0)
+        self.store.enqueue(1, {'chat_id': -1, 'user_id': 10})
+        self.store.forget_user(-1, 10, 2)
+        self.assertEqual([r['content'] for r in self.store.messages(-1)], ['Keep me'])
+        self.assertEqual(self.store.state(-1)['summary'], '')
+        self.assertIsNone(self.store.next_job())
 
     def test_drafts_persist_scope_and_expire_without_changing_character(self):
         from personality import DEFAULTS

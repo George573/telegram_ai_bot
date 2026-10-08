@@ -26,6 +26,7 @@ class Config:
     zai_key: str = ''
     zai_vision_model: str = 'glm-4.6v'
     api_min_interval_seconds: float = 0.25
+    memory_retention_days: int = 30
 
     @classmethod
     def load(cls):
@@ -40,6 +41,7 @@ class Config:
         if not token or not selected_key or not chats or any(x >= 0 for x in chats):
             raise ValueError('Set tokens and approved negative group IDs in .env')
         config = cls(token, key, chats,
+            memory_retention_days=int(os.getenv('MEMORY_RETENTION_DAYS', '30')),
             provider=provider, zai_key=zai_key,
             api_min_interval_seconds=float(os.getenv('API_MIN_INTERVAL_SECONDS', '0.25')),
             zai_vision_model=os.getenv('ZAI_VISION_MODEL', 'glm-4.6v') if provider == 'zai' else 'glm-4.6v',
@@ -53,6 +55,8 @@ class Config:
             superadmin_ids=frozenset(int(x.strip()) for x in os.getenv('BOT_SUPERADMIN_IDS', '').split(',') if x.strip()))
         if not math.isfinite(config.api_min_interval_seconds) or not 0 <= config.api_min_interval_seconds <= 30:
             raise ValueError('API interval must be between 0 and 30 seconds')
+        if not 0 <= config.memory_retention_days <= 3650:
+            raise ValueError('Memory retention must be between 0 and 3650 days')
         if not 1024 <= config.media_max_bytes <= 10 * 1024 * 1024 or not 1 <= config.voice_max_seconds <= 300:
             raise ValueError('Invalid media limits')
         if any(x <= 0 for x in config.superadmin_ids):

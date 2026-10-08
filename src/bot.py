@@ -26,7 +26,7 @@ def main():
     try:
         config = Config.load()
         stage = 'database'
-        store = Store(config.history_limit)
+        store = Store(config.history_limit, retention_days=config.memory_retention_days)
         stage = 'telegram'
         telegram = TelegramAPI(config.telegram_token)
         identity = telegram.call('getMe')

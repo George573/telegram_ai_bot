@@ -54,6 +54,14 @@ UPDATE chats SET summary='',last_reply=NULL;
 ALTER TABLE messages ADD COLUMN thread_id BIGINT NOT NULL DEFAULT 0;
 CREATE INDEX messages_topic_idx ON messages(chat_id,thread_id,id);
 """,
+    """
+ALTER TABLE messages ADD COLUMN sender_id BIGINT;
+ALTER TABLE messages ADD COLUMN telegram_message_id BIGINT;
+ALTER TABLE messages ADD COLUMN created_at TIMESTAMPTZ NOT NULL DEFAULT now();
+ALTER TABLE conversations ADD COLUMN summary_started_at TIMESTAMPTZ;
+UPDATE conversations SET summary_started_at=now() WHERE summary<>'';
+CREATE INDEX messages_sender_idx ON messages(chat_id,sender_id);
+""",
 )
 
 
@@ -72,8 +80,9 @@ def migrate(conn):
 
 
 class Store:
-    def __init__(self, default_limit, conn=None):
+    def __init__(self, default_limit, conn=None, retention_days=30):
         self.default_limit = default_limit
+        self.retention_days = retention_days
         self.thread_id = 0
         self.conn = conn or psycopg.connect(autocommit=True, row_factory=dict_row)
         if not self.conn.execute('SELECT pg_try_advisory_lock(781235689)').fetchone()['pg_try_advisory_lock']:
@@ -97,19 +106,37 @@ class Store:
     def state(self, chat_id):
         self.conn.execute('INSERT INTO chats(id,history_limit) VALUES(%s,%s) ON CONFLICT DO NOTHING', (chat_id, self.default_limit))
         self.conn.execute('INSERT INTO conversations(chat_id,thread_id) VALUES(%s,%s) ON CONFLICT DO NOTHING', (chat_id,self.thread_id))
+        self.expire_memory(chat_id)
         return self.conn.execute('''SELECT c.*,t.summary,t.last_reply FROM chats c JOIN conversations t ON t.chat_id=c.id
             WHERE c.id=%s AND t.thread_id=%s''', (chat_id,self.thread_id)).fetchone()
 
     def messages(self, chat_id):
         return self.conn.execute('SELECT id,role,content FROM messages WHERE chat_id=%s AND thread_id=%s ORDER BY id', (chat_id,self.thread_id)).fetchall()
 
-    def append(self, chat_id, role, content):
-        self.conn.execute('INSERT INTO messages(chat_id,thread_id,role,content) VALUES(%s,%s,%s,%s)', (chat_id,self.thread_id,role,content))
+    def append(self, chat_id, role, content, sender_id=None, message_id=None):
+        self.conn.execute('''INSERT INTO messages(chat_id,thread_id,role,content,sender_id,telegram_message_id)
+            VALUES(%s,%s,%s,%s,%s,%s)''', (chat_id,self.thread_id,role,content,sender_id,message_id))
+
+    def expire_memory(self, chat_id):
+        if self.retention_days:
+            with self.transaction():
+                self.conn.execute("DELETE FROM messages WHERE chat_id=%s AND created_at < now()-%s * interval '1 day'", (chat_id,self.retention_days))
+                self.conn.execute("UPDATE conversations SET summary='',summary_started_at=NULL WHERE chat_id=%s AND summary_started_at < now()-%s * interval '1 day'", (chat_id,self.retention_days))
+
+    def forget_user(self, chat_id, user_id, update_id):
+        with self.transaction():
+            self.conn.execute('DELETE FROM messages WHERE chat_id=%s AND sender_id=%s', (chat_id,user_id))
+            # Legacy history has no trustworthy sender metadata. Clear it too;
+            # summaries cannot safely subtract an individual speaker.
+            self.conn.execute('DELETE FROM messages WHERE chat_id=%s AND sender_id IS NULL', (chat_id,))
+            self.conn.execute("UPDATE conversations SET summary='',summary_started_at=NULL WHERE chat_id=%s", (chat_id,))
+            self.delete_drafts(chat_id, user_id)
+            self.conn.execute("DELETE FROM jobs WHERE payload->>'chat_id'=%s AND update_id<>%s AND (payload->>'user_id'=%s OR phase<>'queued')", (str(chat_id),update_id,str(user_id)))
 
     def clear(self, chat_id):
         self.conn.execute('DELETE FROM messages WHERE chat_id=%s', (chat_id,))
         self.conn.execute("UPDATE chats SET summary='' WHERE id=%s", (chat_id,))
-        self.conn.execute("UPDATE conversations SET summary='' WHERE chat_id=%s", (chat_id,))
+        self.conn.execute("UPDATE conversations SET summary='',summary_started_at=NULL WHERE chat_id=%s", (chat_id,))
 
     def setting(self, chat_id, field, value):
         if field not in {'persona', 'mode', 'paused', 'history_limit', 'personality', 'images_enabled', 'voice_enabled', 'web_enabled'}:
@@ -119,7 +146,10 @@ class Store:
         self.conn.execute(f'UPDATE chats SET {field}=%s WHERE id=%s', (value,chat_id))
 
     def save_summary(self, chat_id, summary, through_id):
-        self.conn.execute('UPDATE conversations SET summary=%s WHERE chat_id=%s AND thread_id=%s', (summary,chat_id,self.thread_id))
+        self.conn.execute('''UPDATE conversations SET summary=%s,
+            summary_started_at=COALESCE(summary_started_at,
+                (SELECT min(created_at) FROM messages WHERE chat_id=%s AND thread_id=%s AND id<=%s),now())
+            WHERE chat_id=%s AND thread_id=%s''', (summary,chat_id,self.thread_id,through_id,chat_id,self.thread_id))
         self.conn.execute('DELETE FROM messages WHERE chat_id=%s AND thread_id=%s AND id<=%s', (chat_id,self.thread_id,through_id))
 
     def checkpoint(self):
@@ -138,6 +168,7 @@ class Store:
             self.conn.execute('UPDATE runtime SET next_update=%s,last_update_at=now() WHERE id=1', (update_id + 1,))
 
     def next_job(self):
+        self.conn.execute("DELETE FROM jobs WHERE created_at < now()-interval '24 hours'")
         return self.conn.execute('''SELECT j.* FROM jobs j
             WHERE j.next_attempt_at <= now() AND NOT EXISTS (
                 SELECT 1 FROM jobs older WHERE older.payload->>'chat_id'=j.payload->>'chat_id'
