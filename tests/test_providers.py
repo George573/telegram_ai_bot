@@ -208,7 +208,7 @@ class ProviderTests(unittest.TestCase):
         self.assertIn('provider: zai', status)
         self.assertIn('voice limit: 30s', status)
         for feature in ['images', 'voice', 'web']:
-            self.assertIn(feature + ': True', status)
+            self.assertIn(feature + (': False' if feature == 'web' else ': True'), status)
             store.enqueue(1, payload('/' + feature + ' on'))
             service.command(store.next_job())
             self.assertTrue(store.chat[feature + '_enabled'])

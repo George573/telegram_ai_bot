@@ -112,6 +112,43 @@ class PostgresTests(unittest.TestCase):
             self.store.reserve(Decimal('1'), Decimal('10'))
         self.assertEqual(self.store.spent(), Decimal('3'))
 
+    def test_concurrent_workers_cannot_overspend_global_budget(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Barrier
+        for chat in (-1, -2):
+            self.store.state(chat)
+        barrier = Barrier(2)
+        def reserve(chat):
+            with psycopg.connect('host=db dbname=roleplay user=roleplay password=test-only-password', autocommit=True, row_factory=dict_row) as conn:
+                worker = Store(50, conn, worker=True)
+                with worker.spending_scope(chat, Decimal('1')):
+                    barrier.wait(timeout=2)
+                    try:
+                        worker.reserve(Decimal('0.7'), Decimal('1'))
+                        return True
+                    except BudgetExceeded:
+                        return False
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            outcomes = list(executor.map(reserve, [-1, -2]))
+        self.assertEqual(sorted(outcomes), [False, True])
+        self.assertEqual(self.store.spent(), Decimal('0.7'))
+
+    def test_deferred_delivery_survives_reconnect_and_allows_other_chat(self):
+        self.store.enqueue(1, {'chat_id': -1})
+        self.store.enqueue(2, {'chat_id': -1})
+        self.store.enqueue(3, {'chat_id': -2})
+        self.store.phase(1, 'generated', 'Synthetic answer', True)
+        self.store.retry_delivery(self.store.next_job(), 300)
+        self.conn.close()
+        self.conn = psycopg.connect('host=db dbname=roleplay user=roleplay password=test-only-password', autocommit=True, row_factory=dict_row)
+        self.store = Store(50, self.conn)
+        self.assertEqual(self.store.next_job()['update_id'], 3)
+        self.assertIsNone(self.store.next_job(-1))
+        row = self.store.job(1)
+        self.assertEqual(row['delivery_attempts'], 1)
+        remaining = self.conn.execute('SELECT EXTRACT(EPOCH FROM (next_attempt_at-now())) AS seconds FROM jobs WHERE update_id=1').fetchone()['seconds']
+        self.assertGreater(remaining, 290)
+
     def test_durable_admission_is_idempotent_and_limits_media(self):
         self.store.state(-1)
         for update in range(1, 4):
