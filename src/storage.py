@@ -44,6 +44,16 @@ ALTER TABLE jobs ADD COLUMN IF NOT EXISTS delivery_attempts INTEGER NOT NULL DEF
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now();
 """,
+    """
+CREATE TABLE conversations (
+ chat_id BIGINT NOT NULL REFERENCES chats(id), thread_id BIGINT NOT NULL DEFAULT 0,
+ summary TEXT NOT NULL DEFAULT '', last_reply TIMESTAMPTZ,
+ PRIMARY KEY(chat_id,thread_id));
+INSERT INTO conversations(chat_id,summary,last_reply) SELECT id,summary,last_reply FROM chats;
+UPDATE chats SET summary='',last_reply=NULL;
+ALTER TABLE messages ADD COLUMN thread_id BIGINT NOT NULL DEFAULT 0;
+CREATE INDEX messages_topic_idx ON messages(chat_id,thread_id,id);
+""",
 )
 
 
@@ -64,6 +74,7 @@ def migrate(conn):
 class Store:
     def __init__(self, default_limit, conn=None):
         self.default_limit = default_limit
+        self.thread_id = 0
         self.conn = conn or psycopg.connect(autocommit=True, row_factory=dict_row)
         if not self.conn.execute('SELECT pg_try_advisory_lock(781235689)').fetchone()['pg_try_advisory_lock']:
             raise RuntimeError('Another bot instance is already using this database')
@@ -74,19 +85,31 @@ class Store:
         with self.conn.transaction():
             yield
 
+    @contextmanager
+    def memory_scope(self, thread_id):
+        previous = self.thread_id
+        self.thread_id = thread_id or 0
+        try:
+            yield
+        finally:
+            self.thread_id = previous
+
     def state(self, chat_id):
         self.conn.execute('INSERT INTO chats(id,history_limit) VALUES(%s,%s) ON CONFLICT DO NOTHING', (chat_id, self.default_limit))
-        return self.conn.execute('SELECT * FROM chats WHERE id=%s', (chat_id,)).fetchone()
+        self.conn.execute('INSERT INTO conversations(chat_id,thread_id) VALUES(%s,%s) ON CONFLICT DO NOTHING', (chat_id,self.thread_id))
+        return self.conn.execute('''SELECT c.*,t.summary,t.last_reply FROM chats c JOIN conversations t ON t.chat_id=c.id
+            WHERE c.id=%s AND t.thread_id=%s''', (chat_id,self.thread_id)).fetchone()
 
     def messages(self, chat_id):
-        return self.conn.execute('SELECT id,role,content FROM messages WHERE chat_id=%s ORDER BY id', (chat_id,)).fetchall()
+        return self.conn.execute('SELECT id,role,content FROM messages WHERE chat_id=%s AND thread_id=%s ORDER BY id', (chat_id,self.thread_id)).fetchall()
 
     def append(self, chat_id, role, content):
-        self.conn.execute('INSERT INTO messages(chat_id,role,content) VALUES(%s,%s,%s)', (chat_id, role, content))
+        self.conn.execute('INSERT INTO messages(chat_id,thread_id,role,content) VALUES(%s,%s,%s,%s)', (chat_id,self.thread_id,role,content))
 
     def clear(self, chat_id):
         self.conn.execute('DELETE FROM messages WHERE chat_id=%s', (chat_id,))
         self.conn.execute("UPDATE chats SET summary='' WHERE id=%s", (chat_id,))
+        self.conn.execute("UPDATE conversations SET summary='' WHERE chat_id=%s", (chat_id,))
 
     def setting(self, chat_id, field, value):
         if field not in {'persona', 'mode', 'paused', 'history_limit', 'personality', 'images_enabled', 'voice_enabled', 'web_enabled'}:
@@ -96,8 +119,8 @@ class Store:
         self.conn.execute(f'UPDATE chats SET {field}=%s WHERE id=%s', (value,chat_id))
 
     def save_summary(self, chat_id, summary, through_id):
-        self.conn.execute('UPDATE chats SET summary=%s WHERE id=%s', (summary,chat_id))
-        self.conn.execute('DELETE FROM messages WHERE chat_id=%s AND id<=%s', (chat_id,through_id))
+        self.conn.execute('UPDATE conversations SET summary=%s WHERE chat_id=%s AND thread_id=%s', (summary,chat_id,self.thread_id))
+        self.conn.execute('DELETE FROM messages WHERE chat_id=%s AND thread_id=%s AND id<=%s', (chat_id,self.thread_id,through_id))
 
     def checkpoint(self):
         # After a week without updates Telegram can choose a lower random ID.
@@ -150,10 +173,10 @@ class Store:
         self.conn.execute('UPDATE runtime SET spent=GREATEST(0,spent-%s+%s) WHERE id=1', (reserved,actual))
 
     def cooling_down(self, chat_id, seconds):
-        return self.conn.execute("SELECT COALESCE(last_reply > now() - %s * interval '1 second', FALSE) AS active FROM chats WHERE id=%s", (seconds,chat_id)).fetchone()['active']
+        return self.conn.execute("SELECT COALESCE(last_reply > now() - %s * interval '1 second', FALSE) AS active FROM conversations WHERE chat_id=%s AND thread_id=%s", (seconds,chat_id,self.thread_id)).fetchone()['active']
 
     def mark_reply(self, chat_id):
-        self.conn.execute('UPDATE chats SET last_reply=now() WHERE id=%s', (chat_id,))
+        self.conn.execute('UPDATE conversations SET last_reply=now() WHERE chat_id=%s AND thread_id=%s', (chat_id,self.thread_id))
 
     def draft(self, chat_id, user_id):
         self.conn.execute('DELETE FROM personality_drafts WHERE expires_at <= now()')

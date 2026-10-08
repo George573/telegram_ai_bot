@@ -387,6 +387,11 @@ class Service:
         job = self.store.next_job()
         if not job:
             return None
+        scope = getattr(self.store, 'memory_scope', None)
+        with scope(job['payload'].get('thread_id')) if scope else nullcontext():
+            return self.process_job(job)
+
+    def process_job(self, job):
         if job['payload']['chat_id'] not in self.config.chats:
             self.store.finish(job['update_id'])
             return 0

@@ -33,6 +33,22 @@ class PostgresTests(unittest.TestCase):
         self.store.enqueue(12, {'chat_id': -2})
         self.assertEqual(self.store.checkpoint(), 13)
         self.assertEqual(self.conn.execute('SELECT count(*) AS n FROM jobs').fetchone()['n'], 2)
+
+    def test_topics_isolate_messages_summary_and_cooldown(self):
+        for topic in (7, 8):
+            with self.store.memory_scope(topic):
+                self.store.state(-1)
+                self.store.append(-1, 'user', f'Topic {topic}')
+        with self.store.memory_scope(7):
+            row = self.store.messages(-1)[0]
+            with self.store.transaction():
+                self.store.save_summary(-1, 'Topic seven summary', row['id'])
+            self.store.mark_reply(-1)
+            self.assertTrue(self.store.cooling_down(-1, 30))
+        with self.store.memory_scope(8):
+            self.assertEqual(self.store.state(-1)['summary'], '')
+            self.assertEqual(self.store.messages(-1)[0]['content'], 'Topic 8')
+            self.assertFalse(self.store.cooling_down(-1, 30))
     def test_state_and_queued_work_survive_reconnect(self):
         self.store.state(-1)
         self.store.setting(-1,'persona','Persistent cat')
