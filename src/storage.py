@@ -98,9 +98,10 @@ def migrate(conn):
 
 
 class Store:
-    def __init__(self, default_limit, conn=None, retention_days=30, worker=False):
+    def __init__(self, default_limit, conn=None, retention_days=30, worker=False, expire_on_read=True):
         self.default_limit = default_limit
         self.retention_days = retention_days
+        self.expire_on_read = expire_on_read
         self.thread_id = 0
         self.budget_chat = None
         self.chat_budget = None
@@ -182,7 +183,8 @@ class Store:
     def state(self, chat_id):
         self.conn.execute('INSERT INTO chats(id,history_limit) VALUES(%s,%s) ON CONFLICT DO NOTHING', (chat_id, self.default_limit))
         self.conn.execute('INSERT INTO conversations(chat_id,thread_id) VALUES(%s,%s) ON CONFLICT DO NOTHING', (chat_id,self.thread_id))
-        self.expire_memory(chat_id)
+        if self.expire_on_read:
+            self.expire_memory(chat_id)
         return self.conn.execute('''SELECT c.*,t.summary,t.last_reply FROM chats c JOIN conversations t ON t.chat_id=c.id
             WHERE c.id=%s AND t.thread_id=%s''', (chat_id,self.thread_id)).fetchone()
 
@@ -198,6 +200,18 @@ class Store:
             with self.transaction():
                 self.conn.execute("DELETE FROM messages WHERE chat_id=%s AND created_at < now()-%s * interval '1 day'", (chat_id,self.retention_days))
                 self.conn.execute("UPDATE conversations SET summary='',summary_started_at=NULL WHERE chat_id=%s AND summary_started_at < now()-%s * interval '1 day'", (chat_id,self.retention_days))
+
+    def maintenance(self, active_chats=()):
+        # Avoid changing source memory underneath a worker's compaction. Idle
+        # groups still expire even when nobody sends another message.
+        active = list(active_chats)
+        with self.transaction():
+            if self.retention_days:
+                self.conn.execute("DELETE FROM messages WHERE NOT (chat_id=ANY(%s::bigint[])) AND created_at < now()-%s * interval '1 day'", (active,self.retention_days))
+                self.conn.execute("UPDATE conversations SET summary='',summary_started_at=NULL WHERE NOT (chat_id=ANY(%s::bigint[])) AND summary_started_at < now()-%s * interval '1 day'", (active,self.retention_days))
+            self.conn.execute("DELETE FROM jobs WHERE NOT ((payload->>'chat_id')::bigint=ANY(%s::bigint[])) AND created_at < now()-interval '24 hours'", (active,))
+            self.conn.execute('DELETE FROM personality_drafts WHERE expires_at<=now()')
+            self.conn.execute("DELETE FROM rate_limits WHERE updated_at < now()-interval '1 hour'")
 
     def forget_user(self, chat_id, user_id, update_id):
         with self.transaction():

@@ -64,7 +64,7 @@ def main():
     try:
         config = Config.load()
         stage = 'database'
-        store = Store(config.history_limit, retention_days=config.memory_retention_days)
+        store = Store(config.history_limit, retention_days=config.memory_retention_days, expire_on_read=False)
         stage = 'telegram'
         telegram = TelegramAPI(config.telegram_token)
         identity = telegram.call('getMe')
@@ -77,10 +77,14 @@ def main():
         stage = 'running'
         event('bot_started', provider=config.provider, model=config.model, budget_usd=config.budget)
         pacer = RequestPacer(config.api_min_interval_seconds)
+        next_maintenance = 0.0
         with ThreadPoolExecutor(max_workers=config.worker_count, thread_name_prefix='chat-worker') as workers:
             scheduler = ChatScheduler(workers, config.worker_count,
                 lambda chat_id: work_chat(config, chat_id, identity, pacer))
             while not STOP:
+                if time.monotonic() >= next_maintenance:
+                    store.maintenance(scheduler.active)
+                    next_maintenance = time.monotonic() + 60
                 scheduler.tick(store.runnable_chats())
                 try:
                     updates = telegram.call('getUpdates', offset=store.checkpoint(), limit=100,

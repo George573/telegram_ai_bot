@@ -10,6 +10,7 @@ from model import ModelFailure
 from telegram_api import TelegramFailure
 
 BASE_HELP = ('Send photos or voice notes; reply to me or address me in the photo caption in directed mode. '
+             '/forgetme deletes your local messages and clears group summaries. '
              'Use /search <public query> for an explicit lookup when a manager has enabled /web on. Only that query is sent to search. '
              'Media becomes descriptions/transcripts in memory. Talk with /chat <message>, mention me, use a configured character name, or reply to me. '
              '/help works while paused. /whoami shows your Telegram user ID. '
@@ -181,17 +182,21 @@ class Service:
         if not self.feature_available(feature):
             return 'unavailable'
         field = {'images': 'images_enabled', 'voice': 'voice_enabled', 'web': 'web_enabled'}[feature]
-        return str(state.get(field, True))
+        return str(state.get(field, feature != 'web'))
 
     def status(self, chat_id):
         state = self.store.state(chat_id)
         privacy = 'unknown' if self.privacy_enabled is None else ('enabled' if self.privacy_enabled else 'disabled')
         vision = f'; vision model: {self.config.zai_vision_model}' if self.config.provider == 'zai' else ''
+        chat_budget = self.config.chat_budget or self.config.budget / len(self.config.chats)
         return (f"Context: {state['mode']}; paused: {state['paused']}; history limit: {state['history_limit']}; "
                 f"stored: {len(self.store.messages(chat_id))}; summary: {bool(state['summary'])}; "
                 f"images: {self.feature_status(state, 'images')}; voice: {self.feature_status(state, 'voice')}; web: {self.feature_status(state, 'web')}; "
                 f"BotFather privacy (at startup): {privacy}; incidental reply cooldown: {self.config.cooldown}s; "
-                f"voice limit: {self.voice_limit()}s; provider: {self.config.provider}; model: {self.config.model}{vision}; tracked lifetime spend: ${self.store.spent():.4f} / ${self.config.budget}")
+                f"voice limit: {self.voice_limit()}s; provider: {self.config.provider}; model: {self.config.model}{vision}; "
+                f"memory retention: {self.config.memory_retention_days} days (0 means no expiry); "
+                f"turn limits per minute: user {self.config.user_requests_per_minute}, group {self.config.chat_requests_per_minute}, user media {self.config.user_media_per_minute}; "
+                f"chat spend: ${state.get('spent', 0):.4f} / ${chat_budget}; tracked lifetime spend: ${self.store.spent():.4f} / ${self.config.budget}")
 
     def command(self, job):
         payload = job['payload']
@@ -415,7 +420,7 @@ class Service:
         # Mark before sending: after a crash, an uncertain send is NOT retried.
         self.store.phase(job['update_id'], 'sending', job['answer'], job['assistant'])
         try:
-            self.telegram.send(job['payload'], job['answer'])
+            delivered = self.telegram.send(job['payload'], job['answer'])
         except TelegramFailure as error:
             event('delivery_failed', level=logging.WARNING, update_id=job['update_id'],
                   status_code=error.code, retry_after=error.retry_after)
@@ -428,7 +433,8 @@ class Service:
         event('reply_delivered', update_id=job['update_id'])
         with self.store.transaction():
             if job['assistant']:
-                self.store.append(job['payload']['chat_id'], 'assistant', job['answer'])
+                self.store.append(job['payload']['chat_id'], 'assistant', job['answer'],
+                                  message_id=delivered.get('message_id') if isinstance(delivered, dict) else None)
                 self.store.mark_reply(job['payload']['chat_id'])
             self.store.finish(job['update_id'])
         return 0

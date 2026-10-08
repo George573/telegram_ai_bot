@@ -175,6 +175,17 @@ class PostgresTests(unittest.TestCase):
         self.assertEqual(self.store.state(-1)['summary'], '')
         self.assertFalse(self.store.messages(-1))
 
+    def test_maintenance_expires_idle_groups_but_excludes_active_workers(self):
+        for chat in (-1, -2):
+            self.store.state(chat)
+            self.store.append(chat, 'user', 'Old data')
+        self.conn.execute("UPDATE messages SET created_at=now()-interval '31 days'")
+        self.store.maintenance([-1])
+        self.assertTrue(self.store.messages(-1))
+        self.assertFalse(self.store.messages(-2))
+        self.store.maintenance()
+        self.assertFalse(self.store.messages(-1))
+
     def test_forget_user_clears_derived_data_but_preserves_other_senders(self):
         self.store.state(-1)
         self.store.append(-1, 'user', 'Delete me', sender_id=10, message_id=20)
