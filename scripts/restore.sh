@@ -15,7 +15,20 @@ test -f "$restore_file"
 docker compose stop bot
 # Preserve any more recent local spending before replacing the database.
 previous_spend=$(docker compose exec -T db psql -U postgres -d roleplay -At -v ON_ERROR_STOP=1 -c 'SELECT spent FROM runtime WHERE id=1')
-docker compose exec -T db pg_restore -U postgres -d roleplay --single-transaction --exit-on-error --clean --if-exists < "$restore_file"
+if ! docker compose exec -T db sh -c '
+  set -eu
+  umask 077
+  restore_sql=$(mktemp /tmp/roleplay-restore.XXXXXX)
+  trap '\''rm -f "$restore_sql"'\'' EXIT INT TERM
+  {
+    printf "DROP SCHEMA public CASCADE;\nCREATE SCHEMA public AUTHORIZATION roleplay;\n"
+    pg_restore --exit-on-error --no-owner --role=roleplay -f -
+  } > "$restore_sql" 2>/dev/null
+  psql -U postgres -d roleplay --single-transaction -v ON_ERROR_STOP=1 -f "$restore_sql" >/dev/null 2>&1
+' < "$restore_file"; then
+  printf 'Restore failed; the bot remains stopped. The database replacement is transactional.\n' >&2
+  exit 1
+fi
 docker compose exec -T db psql -U postgres -d roleplay -v ON_ERROR_STOP=1 -v floor="$restore_floor" -v previous="$previous_spend" <<'SQL'
 BEGIN;
 -- Old archives may predate the ledger. Startup migrations will adopt them.
@@ -29,6 +42,9 @@ INSERT INTO spending_ledger(kind,amount) SELECT 'legacy_balance',spent FROM runt
 INSERT INTO spending_ledger(kind,amount)
  SELECT 'restore_floor',GREATEST(spent,:'floor'::numeric,:'previous'::numeric)-spent FROM runtime WHERE id=1;
 UPDATE runtime SET spent=GREATEST(spent,:'floor'::numeric,:'previous'::numeric) WHERE id=1;
+-- Conservatively protect chat allowances too when old archives lack them.
+ALTER TABLE chats ADD COLUMN IF NOT EXISTS spent NUMERIC(14,8) NOT NULL DEFAULT 0;
+UPDATE chats SET spent=GREATEST(spent,:'floor'::numeric,:'previous'::numeric);
 -- Never replay replies or drafts from an older point in time.
 DELETE FROM jobs;
 DELETE FROM personality_drafts;
