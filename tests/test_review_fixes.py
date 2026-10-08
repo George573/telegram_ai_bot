@@ -41,3 +41,29 @@ class ReviewFixTests(unittest.TestCase):
         for _ in range(5):
             service.process_one()
         self.assertFalse(self.store.jobs)
+
+    def test_search_receives_only_explicit_query(self):
+        service = self.setup_service()
+        self.store.chat['web_enabled'] = True
+        self.store.chat['summary'] = 'Private summary'
+        self.store.append(-1, 'user', 'Private history')
+        calls = []
+        def generate(instructions, history, **options):
+            calls.append((instructions, history, options))
+            return 'Public answer'
+        self.model.generate = generate
+        service.accept(1, payload('/search weather in Paris'))
+        service.process_one()
+        self.assertEqual(calls[0][1], [{'role': 'user', 'content': 'weather in Paris'}])
+        self.assertTrue(calls[0][2]['allow_search'])
+        self.assertNotIn('Private', str(calls))
+
+    def test_normal_reply_never_enables_search(self):
+        service = self.setup_service()
+        self.store.chat['web_enabled'] = True
+        calls = []
+        self.model.generate = lambda *args, **kw: calls.append(kw) or 'Answer'
+        service.accept(1, payload())
+        service.process_one()
+        service.process_one()
+        self.assertFalse(calls[-1]['allow_search'])
