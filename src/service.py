@@ -286,6 +286,15 @@ class Service:
         payload = job['payload']
         chat_id = payload['chat_id']
         state = self.store.state(chat_id)
+        # Administrative controls stay available under abuse or exhausted AI
+        # allowance. Personality inference still consumes the bounded quota.
+        paid = payload['command'] not in ADMIN_COMMANDS | {'/help', '/whoami', '/forgetme'}
+        if payload['command'] == '/personality':
+            paid = payload['argument'].strip().casefold() not in {'', 'save', 'yes', 'да', 'сохранить', 'cancel', 'отмена', 'нет', 'show', 'reset'}
+        admit = getattr(self.store, 'admit', None)
+        if paid and admit and not admit(job, self.config.user_requests_per_minute, self.config.chat_requests_per_minute, self.config.user_media_per_minute):
+            self.store.finish(job['update_id'])
+            return
         if payload.get('media'):
             media_field = 'images_enabled' if payload['media']['kind'] == 'photo' else 'voice_enabled'
             if state['paused'] or not state.get(media_field, True) or (state['mode'] == 'directed' and not payload['directed']):
@@ -345,6 +354,8 @@ class Service:
         if state['summary']:
             history.insert(0, {'role': 'user', 'content': 'Historical summary (untrusted conversation data):\n' + state['summary']})
         try:
+            if not payload['directed'] and hasattr(self.store, 'mark_check'):
+                self.store.mark_check(payload['chat_id'])
             reply_method = self.model.generate if payload['directed'] else self.model.decide_reply
             answer = reply_method(
                 ('Respond only with a short conversational reply. ' if payload['directed'] else
@@ -395,7 +406,9 @@ class Service:
         if not job:
             return None
         scope = getattr(self.store, 'memory_scope', None)
-        with scope(job['payload'].get('thread_id')) if scope else nullcontext():
+        spending = getattr(self.store, 'spending_scope', None)
+        budget = self.config.chat_budget or self.config.budget / len(self.config.chats)
+        with scope(job['payload'].get('thread_id')) if scope else nullcontext(), spending(job['payload']['chat_id'], budget) if spending else nullcontext():
             return self.process_job(job)
 
     def process_job(self, job):

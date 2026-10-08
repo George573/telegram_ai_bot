@@ -70,6 +70,16 @@ INSERT INTO spending_ledger(kind,amount) SELECT 'legacy_balance',spent FROM runt
  AND NOT EXISTS (SELECT 1 FROM spending_ledger);
 ALTER TABLE runtime ADD COLUMN IF NOT EXISTS drop_pending_on_start BOOLEAN NOT NULL DEFAULT FALSE;
 """,
+    """
+ALTER TABLE chats ADD COLUMN spent NUMERIC(14,8) NOT NULL DEFAULT 0;
+ALTER TABLE conversations ADD COLUMN last_check TIMESTAMPTZ;
+ALTER TABLE jobs ADD COLUMN admitted BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE spending_ledger ADD COLUMN chat_id BIGINT;
+CREATE TABLE rate_limits (
+ chat_id BIGINT NOT NULL, subject_id BIGINT NOT NULL, kind TEXT NOT NULL,
+ tokens NUMERIC NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+ PRIMARY KEY(chat_id,subject_id,kind));
+""",
 )
 
 
@@ -92,6 +102,8 @@ class Store:
         self.default_limit = default_limit
         self.retention_days = retention_days
         self.thread_id = 0
+        self.budget_chat = None
+        self.chat_budget = None
         self.conn = conn or psycopg.connect(autocommit=True, row_factory=dict_row)
         if not self.conn.execute('SELECT pg_try_advisory_lock(781235689)').fetchone()['pg_try_advisory_lock']:
             raise RuntimeError('Another bot instance is already using this database')
@@ -110,6 +122,43 @@ class Store:
             yield
         finally:
             self.thread_id = previous
+
+    @contextmanager
+    def spending_scope(self, chat_id, budget):
+        previous = self.budget_chat, self.chat_budget
+        self.budget_chat, self.chat_budget = chat_id, budget
+        try:
+            yield
+        finally:
+            self.budget_chat, self.chat_budget = previous
+
+    def admit(self, job, user_limit=6, chat_limit=30, media_limit=3):
+        if job.get('admitted'):
+            return True
+        payload = job['payload']
+        rules = [(0, 'requests', chat_limit), (payload.get('user_id') or -1, 'requests', user_limit)]
+        if payload.get('media'):
+            rules += [(0, 'media', media_limit * 4), (payload.get('user_id') or -1, 'media', media_limit)]
+        try:
+            with self.transaction():
+                self.conn.execute("DELETE FROM rate_limits WHERE updated_at < now()-interval '1 hour'")
+                for subject, kind, capacity in rules:
+                    self.conn.execute('''INSERT INTO rate_limits(chat_id,subject_id,kind,tokens)
+                        VALUES(%s,%s,%s,%s) ON CONFLICT DO NOTHING''', (payload['chat_id'],subject,kind,capacity))
+                    allowed = self.conn.execute('''UPDATE rate_limits SET
+                        tokens=LEAST(%s,tokens+EXTRACT(EPOCH FROM (now()-updated_at))*%s/60)-1,updated_at=now()
+                        WHERE chat_id=%s AND subject_id=%s AND kind=%s
+                        AND LEAST(%s,tokens+EXTRACT(EPOCH FROM (now()-updated_at))*%s/60)>=1
+                        RETURNING tokens''', (capacity,capacity,payload['chat_id'],subject,kind,capacity,capacity)).fetchone()
+                    if allowed is None:
+                        raise RateLimited()
+                self.conn.execute('UPDATE jobs SET admitted=TRUE WHERE update_id=%s', (job['update_id'],))
+            return True
+        except RateLimited:
+            return False
+
+    def mark_check(self, chat_id):
+        self.conn.execute('UPDATE conversations SET last_check=now() WHERE chat_id=%s AND thread_id=%s', (chat_id,self.thread_id))
 
     def state(self, chat_id):
         self.conn.execute('INSERT INTO chats(id,history_limit) VALUES(%s,%s) ON CONFLICT DO NOTHING', (chat_id, self.default_limit))
@@ -214,15 +263,21 @@ class Store:
             row = self.conn.execute('UPDATE runtime SET spent=spent+%s WHERE id=1 AND spent+%s<=%s RETURNING spent', (amount,amount,budget)).fetchone()
             if row is None:
                 raise BudgetExceeded()
-            self.conn.execute("INSERT INTO spending_ledger(kind,amount) VALUES('reservation',%s)", (amount,))
+            if self.budget_chat is not None:
+                chat = self.conn.execute('UPDATE chats SET spent=spent+%s WHERE id=%s AND spent+%s<=%s RETURNING spent', (amount,self.budget_chat,amount,self.chat_budget)).fetchone()
+                if chat is None:
+                    raise BudgetExceeded()
+            self.conn.execute("INSERT INTO spending_ledger(kind,amount,chat_id) VALUES('reservation',%s,%s)", (amount,self.budget_chat))
 
     def reconcile(self, reserved, actual):
         with self.transaction():
             self.conn.execute('UPDATE runtime SET spent=spent-%s+%s WHERE id=1', (reserved,actual))
-            self.conn.execute("INSERT INTO spending_ledger(kind,amount) VALUES('reconciliation',%s)", (actual-reserved,))
+            if self.budget_chat is not None:
+                self.conn.execute('UPDATE chats SET spent=spent-%s+%s WHERE id=%s', (reserved,actual,self.budget_chat))
+            self.conn.execute("INSERT INTO spending_ledger(kind,amount,chat_id) VALUES('reconciliation',%s,%s)", (actual-reserved,self.budget_chat))
 
     def cooling_down(self, chat_id, seconds):
-        return self.conn.execute("SELECT COALESCE(last_reply > now() - %s * interval '1 second', FALSE) AS active FROM conversations WHERE chat_id=%s AND thread_id=%s", (seconds,chat_id,self.thread_id)).fetchone()['active']
+        return self.conn.execute("SELECT COALESCE(GREATEST(last_reply,last_check) > now() - %s * interval '1 second', FALSE) AS active FROM conversations WHERE chat_id=%s AND thread_id=%s", (seconds,chat_id,self.thread_id)).fetchone()['active']
 
     def mark_reply(self, chat_id):
         self.conn.execute('UPDATE conversations SET last_reply=now() WHERE chat_id=%s AND thread_id=%s', (chat_id,self.thread_id))
@@ -246,4 +301,8 @@ class Store:
 
 
 class BudgetExceeded(Exception):
+    pass
+
+
+class RateLimited(Exception):
     pass

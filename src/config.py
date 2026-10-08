@@ -27,6 +27,10 @@ class Config:
     zai_vision_model: str = 'glm-4.6v'
     api_min_interval_seconds: float = 0.25
     memory_retention_days: int = 30
+    user_requests_per_minute: int = 6
+    chat_requests_per_minute: int = 30
+    user_media_per_minute: int = 3
+    chat_budget: Decimal = Decimal('0')
 
     @classmethod
     def load(cls):
@@ -42,6 +46,10 @@ class Config:
             raise ValueError('Set tokens and approved negative group IDs in .env')
         config = cls(token, key, chats,
             memory_retention_days=int(os.getenv('MEMORY_RETENTION_DAYS', '30')),
+            user_requests_per_minute=int(os.getenv('USER_REQUESTS_PER_MINUTE', '6')),
+            chat_requests_per_minute=int(os.getenv('CHAT_REQUESTS_PER_MINUTE', '30')),
+            user_media_per_minute=int(os.getenv('USER_MEDIA_PER_MINUTE', '3')),
+            chat_budget=Decimal(os.getenv('CHAT_BUDGET_USD', '0')),
             provider=provider, zai_key=zai_key,
             api_min_interval_seconds=float(os.getenv('API_MIN_INTERVAL_SECONDS', '0.25')),
             zai_vision_model=os.getenv('ZAI_VISION_MODEL', 'glm-4.6v') if provider == 'zai' else 'glm-4.6v',
@@ -57,6 +65,10 @@ class Config:
             raise ValueError('API interval must be between 0 and 30 seconds')
         if not 0 <= config.memory_retention_days <= 3650:
             raise ValueError('Memory retention must be between 0 and 3650 days')
+        if any(not 1 <= limit <= 1000 for limit in (config.user_requests_per_minute, config.chat_requests_per_minute, config.user_media_per_minute)):
+            raise ValueError('Request limits must be between 1 and 1000')
+        if not config.chat_budget.is_finite() or config.chat_budget < 0:
+            raise ValueError('Invalid per-chat budget')
         if not 1024 <= config.media_max_bytes <= 10 * 1024 * 1024 or not 1 <= config.voice_max_seconds <= 300:
             raise ValueError('Invalid media limits')
         if any(x <= 0 for x in config.superadmin_ids):

@@ -82,6 +82,33 @@ class PostgresTests(unittest.TestCase):
         self.store.reconcile(Decimal('2'), Decimal('0.5'))
         after = self.conn.execute('SELECT sum(amount) AS total FROM spending_ledger').fetchone()['total']
         self.assertEqual(after-before, Decimal('0.5'))
+
+    def test_per_chat_budget_is_atomic_with_global_budget(self):
+        self.store.state(-1)
+        self.store.state(-2)
+        with self.store.spending_scope(-1, Decimal('2')):
+            self.store.reserve(Decimal('2'), Decimal('10'))
+            with self.assertRaises(BudgetExceeded):
+                self.store.reserve(Decimal('1'), Decimal('10'))
+        self.assertEqual(self.store.spent(), Decimal('2'))
+        with self.store.spending_scope(-2, Decimal('2')):
+            self.store.reserve(Decimal('1'), Decimal('10'))
+        self.assertEqual(self.store.spent(), Decimal('3'))
+
+    def test_durable_admission_is_idempotent_and_limits_media(self):
+        self.store.state(-1)
+        for update in range(1, 4):
+            self.store.enqueue(update, {'chat_id': -1, 'user_id': 10, 'media': {'kind': 'photo'}})
+        job = self.store.next_job()
+        self.assertTrue(self.store.admit(job, media_limit=1))
+        self.assertTrue(self.store.admit(self.store.next_job(), media_limit=1))
+        self.store.finish(1)
+        self.assertFalse(self.store.admit(self.store.next_job(), media_limit=1))
+
+    def test_silent_participation_checks_start_cooldown(self):
+        self.store.state(-1)
+        self.store.mark_check(-1)
+        self.assertTrue(self.store.cooling_down(-1, 10))
     def test_application_role_is_not_administrator(self):
         role=self.conn.execute('SELECT rolsuper,rolcreaterole FROM pg_roles WHERE rolname=current_user').fetchone()
         self.assertFalse(role['rolsuper'])
