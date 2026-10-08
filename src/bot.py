@@ -30,6 +30,9 @@ def main():
         stage = 'telegram'
         telegram = TelegramAPI(config.telegram_token)
         identity = telegram.call('getMe')
+        if store.discard_backlog_required():
+            telegram.call('deleteWebhook', drop_pending_updates=True)
+            store.backlog_discarded()
         stage = 'provider'
         service = Service(config, store, telegram, Model(config, store),
                           privacy_enabled=not identity.get('can_read_all_group_messages', False))

@@ -75,6 +75,13 @@ class PostgresTests(unittest.TestCase):
         self.store.reserve(Decimal('9'),Decimal('10'))
         with self.assertRaises(BudgetExceeded): self.store.reserve(Decimal('2'),Decimal('10'))
         self.assertEqual(self.store.spent(),Decimal('9'))
+
+    def test_spending_ledger_matches_reservations_and_reconciliation(self):
+        before = self.conn.execute('SELECT COALESCE(sum(amount),0) AS total FROM spending_ledger').fetchone()['total']
+        self.store.reserve(Decimal('2'), Decimal('10'))
+        self.store.reconcile(Decimal('2'), Decimal('0.5'))
+        after = self.conn.execute('SELECT sum(amount) AS total FROM spending_ledger').fetchone()['total']
+        self.assertEqual(after-before, Decimal('0.5'))
     def test_application_role_is_not_administrator(self):
         role=self.conn.execute('SELECT rolsuper,rolcreaterole FROM pg_roles WHERE rolname=current_user').fetchone()
         self.assertFalse(role['rolsuper'])

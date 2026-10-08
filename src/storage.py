@@ -62,6 +62,14 @@ ALTER TABLE conversations ADD COLUMN summary_started_at TIMESTAMPTZ;
 UPDATE conversations SET summary_started_at=now() WHERE summary<>'';
 CREATE INDEX messages_sender_idx ON messages(chat_id,sender_id);
 """,
+    """
+CREATE TABLE IF NOT EXISTS spending_ledger (
+ id BIGSERIAL PRIMARY KEY, kind TEXT NOT NULL,
+ amount NUMERIC(14,8) NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now());
+INSERT INTO spending_ledger(kind,amount) SELECT 'legacy_balance',spent FROM runtime WHERE id=1
+ AND NOT EXISTS (SELECT 1 FROM spending_ledger);
+ALTER TABLE runtime ADD COLUMN IF NOT EXISTS drop_pending_on_start BOOLEAN NOT NULL DEFAULT FALSE;
+""",
 )
 
 
@@ -159,6 +167,12 @@ class Store:
         self.conn.execute("UPDATE runtime SET next_update=0 WHERE id=1 AND last_update_at < now()-interval '7 days'")
         return self.conn.execute('SELECT next_update FROM runtime WHERE id=1').fetchone()['next_update']
 
+    def discard_backlog_required(self):
+        return self.conn.execute('SELECT drop_pending_on_start FROM runtime WHERE id=1').fetchone()['drop_pending_on_start']
+
+    def backlog_discarded(self):
+        self.conn.execute('UPDATE runtime SET drop_pending_on_start=FALSE,next_update=0,last_update_at=now() WHERE id=1')
+
     def enqueue(self, update_id, payload):
         with self.transaction():
             if update_id < self.checkpoint():
@@ -196,12 +210,16 @@ class Store:
         return self.conn.execute('SELECT spent FROM runtime WHERE id=1').fetchone()['spent']
 
     def reserve(self, amount, budget):
-        row = self.conn.execute('UPDATE runtime SET spent=spent+%s WHERE id=1 AND spent+%s<=%s RETURNING spent', (amount,amount,budget)).fetchone()
-        if row is None:
-            raise BudgetExceeded()
+        with self.transaction():
+            row = self.conn.execute('UPDATE runtime SET spent=spent+%s WHERE id=1 AND spent+%s<=%s RETURNING spent', (amount,amount,budget)).fetchone()
+            if row is None:
+                raise BudgetExceeded()
+            self.conn.execute("INSERT INTO spending_ledger(kind,amount) VALUES('reservation',%s)", (amount,))
 
     def reconcile(self, reserved, actual):
-        self.conn.execute('UPDATE runtime SET spent=GREATEST(0,spent-%s+%s) WHERE id=1', (reserved,actual))
+        with self.transaction():
+            self.conn.execute('UPDATE runtime SET spent=spent-%s+%s WHERE id=1', (reserved,actual))
+            self.conn.execute("INSERT INTO spending_ledger(kind,amount) VALUES('reconciliation',%s)", (actual-reserved,))
 
     def cooling_down(self, chat_id, seconds):
         return self.conn.execute("SELECT COALESCE(last_reply > now() - %s * interval '1 second', FALSE) AS active FROM conversations WHERE chat_id=%s AND thread_id=%s", (seconds,chat_id,self.thread_id)).fetchone()['active']
