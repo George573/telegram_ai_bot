@@ -125,6 +125,8 @@ class Service:
             self.store.save_summary(chat_id, summary, remove[-1]['id'])
 
     def accept(self, update_id, payload):
+        if payload and payload['chat_id'] not in self.config.chats:
+            payload = None
         if payload:
             state = self.store.state(payload['chat_id'])
             payload = dict(payload)
@@ -367,6 +369,9 @@ class Service:
         job = self.store.next_job()
         if not job:
             return None
+        if job['payload']['chat_id'] not in self.config.chats:
+            self.store.finish(job['update_id'])
+            return 0
         event('job_processing', update_id=job['update_id'], phase=job['phase'])
         if job['phase'] == 'sending':
             event('delivery_unknown', level=logging.WARNING, update_id=job['update_id'])
