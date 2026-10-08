@@ -1,7 +1,14 @@
-.env
-.env.*
-credentials
-.git
-__pycache__
-backups
-work
+# Only application/build inputs enter the daemon's build context.
+**
+!Dockerfile
+!Dockerfile.db
+!Dockerfile.test
+!requirements.lock
+!src/
+!src/*.py
+!scripts/
+!scripts/*.sh
+!scripts/*.sql
+!scripts/discover_chat.py
+!tests/
+!tests/test_*.py

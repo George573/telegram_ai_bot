@@ -33,6 +33,9 @@ services:
         condition: service_healthy
     networks: [backend, egress]
     restart: unless-stopped
+    mem_limit: ${BOT_MEMORY_LIMIT:-512m}
+    cpus: ${BOT_CPU_LIMIT:-1.0}
+    pids_limit: 128
     read_only: true
     tmpfs:
       - /tmp:size=16m,mode=1777
@@ -57,6 +60,10 @@ services:
       - database:/var/lib/postgresql/data
     networks: [backend]
     restart: unless-stopped
+    mem_limit: ${DB_MEMORY_LIMIT:-512m}
+    cpus: ${DB_CPU_LIMIT:-1.0}
+    pids_limit: 128
+    shm_size: 128m
     security_opt: [no-new-privileges:true]
     healthcheck:
       test: [CMD-SHELL, "pg_isready -U postgres -d roleplay"]
