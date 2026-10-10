@@ -295,6 +295,10 @@ The handler also accepts batches of allowed function calls in a single model res
 
 Both providers receive the same local function tools in the same order: `load_skill`, `search_web`, `read_yandex_reviews`, `read_afisha_listing`, `read_afisha_event`. OpenAI's hosted search and Z.ai's native in-chat search are no longer offered inside the conversation, so switching models changes neither the tool loop nor the skills.
 
+At most five `search_web` calls run per request (extra calls receive `search_limit`), and the model is told when it is on its last research step. The plain-text "Sources:" block lists only results the answer actually mentions (by URL or domain) plus Maps/Afisha pages the bot opened, never the first results of every search. Instructions forbid promising a later search or follow-up: the final step must answer now or state what could not be found.
+
+`glm-5.3-flash` reasons inside its `max_tokens`, so it always runs with `reasoning_effort=low` and an extra 2,000-token allowance above the reply budget; reservations include the allowance. Without it, a 600-token reply budget could be spent entirely on reasoning, producing an empty answer.
+
 `search_web({"query", "site", "recency"})`: `site` is `afisha.yandex.ru`, `yandex.ru/maps` or null; `recency` is `day`, `week`, `month`, `year` or null. On Z.ai these map to `search_domain_filter` and `search_recency_filter`. Z.ai documents those filters under a different engine name, so if a filtered request is rejected (HTTP 400) it is retried once as a plain `site:` query and logged with `filters_applied=false`. On OpenAI, `search_web` runs a separate small Responses request with the hosted `web_search` tool, `filters.allowed_domains`, an approximate Moscow `user_location`, and a recency hint; it returns the cited URLs with their cited sentence as the snippet, then other consulted sources. `yandex.ru/maps` cannot be path-filtered, so the query also names Yandex Maps. Both use the same API key and billing as the selected provider. Whether Z.ai accepts the filters, and the exact OpenAI search output, are mocked in tests and have not been verified live.
 
 ### Recommendation cards
