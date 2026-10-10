@@ -628,6 +628,8 @@ class Model:
         if image is not None and len(image) > min(self.config.media_max_bytes, IMAGE_MAX_BYTES[self.config.provider]):
             raise ModelFailure('Photo exceeds size limit')
         instructions = self.provider.prepare_instructions(instructions, response_format)
+        # Thinking models get extra room for reasoning; the reservation covers it.
+        output_tokens = self.provider.token_ceiling(request_model, output_tokens)
         # Conversation and tool results are bounded separately; generate() stops
         # adding tool output before the tool budget is exceeded.
         if (len(instructions) + sum(len(x['content']) for x in history) > self.config.max_input_chars

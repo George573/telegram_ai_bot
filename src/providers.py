@@ -48,6 +48,9 @@ SEARCH_WEB = {'name': 'search_web',
 READERS = (READ_YANDEX_REVIEWS, READ_AFISHA_LISTING, READ_AFISHA_EVENT)
 # Search requests leave the bot with a fixed location hint, never user data.
 SEARCH_LOCATION = {'type': 'approximate', 'country': 'RU', 'city': 'Moscow', 'timezone': 'Europe/Moscow'}
+# Models whose reasoning shares max_tokens with the visible answer, and the extra room they get.
+THINKING_MODELS = frozenset({'glm-5.3-flash'})
+THINKING_ALLOWANCE = 2000
 RECENCY_HINTS = {'day': 'the last day', 'week': 'the last week', 'month': 'the last month', 'year': 'the last year'}
 TRANSCRIPTION_PER_MINUTE = TRANSCRIPTION_RATES['openai']
 
@@ -228,6 +231,9 @@ class OpenAIProvider:
     def generation_model(self, model, image):
         return model
 
+    def token_ceiling(self, model, output_tokens):
+        return output_tokens
+
     def prepare_instructions(self, instructions, response_format):
         return instructions
 
@@ -314,6 +320,11 @@ class ZaiProvider:
     def generation_model(self, model, image):
         return self.vision_model if image is not None else model
 
+    def token_ceiling(self, model, output_tokens):
+        # Reasoning counts against max_tokens: without extra room a small reply
+        # budget is spent on thinking and the answer comes back empty.
+        return output_tokens + THINKING_ALLOWANCE if model in THINKING_MODELS else output_tokens
+
     def prepare_instructions(self, instructions, response_format):
         if response_format:
             instructions += '\nReturn only a JSON object matching this schema:\n' + json.dumps(response_format['schema'])
@@ -341,11 +352,11 @@ class ZaiProvider:
             # Shared Model validation still checks the resulting object.
             extra['response_format'] = {'type': 'json_object'}
         messages = [{'role': 'system', 'content': instructions}] + history + list(continuation)
-        extra_body = {'thinking': {'type': 'enabled' if model == 'glm-5.3-flash' else 'disabled'}}
-        if response_format and model == 'glm-5.3-flash':
-            # This model requires thinking; max effort can exhaust small output
-            # budgets before producing JSON. Keep the existing token ceiling.
+        extra_body = {'thinking': {'type': 'enabled' if model in THINKING_MODELS else 'disabled'}}
+        if model in THINKING_MODELS:
+            # This model requires thinking; low effort keeps it inside token_ceiling().
             extra_body['reasoning_effort'] = 'low'
+        if response_format and model in THINKING_MODELS:
             # Keep formatting authoritative after conversational role-play and
             # distinguish an instance of the requested schema from the schema.
             messages.append({'role': 'system', 'content':

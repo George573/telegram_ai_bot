@@ -11,6 +11,7 @@ import httpx
 from openai import OpenAI
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 from config import Config
+from providers import THINKING_ALLOWANCE
 from model import Model, ModelFailure, estimate_cost
 from storage import BudgetExceeded
 from test_clients import Allowance
@@ -35,8 +36,13 @@ class ProviderTests(unittest.TestCase):
                 model, store, calls = self.model(model=name)
                 self.assertEqual(model.generate('Cat', []), 'Hello')
                 self.assertEqual(calls[0]['model'], name)
-                thinking = 'enabled' if name == 'glm-5.3-flash' else 'disabled'
-                self.assertEqual(calls[0]['extra_body'], {'thinking': {'type': thinking}})
+                if name == 'glm-5.3-flash':
+                    # Reasoning shares max_tokens with the answer, so it gets its own allowance.
+                    self.assertEqual(calls[0]['extra_body'], {'thinking': {'type': 'enabled'}, 'reasoning_effort': 'low'})
+                    self.assertEqual(calls[0]['max_tokens'], 600 + THINKING_ALLOWANCE)
+                else:
+                    self.assertEqual(calls[0]['extra_body'], {'thinking': {'type': 'disabled'}})
+                    self.assertEqual(calls[0]['max_tokens'], 600)
                 self.assertEqual(store.total, (100 * input_rate * Decimal('1.25')
                                               + 10 * output_rate) / 1000000)
 
@@ -124,7 +130,7 @@ class ProviderTests(unittest.TestCase):
             self.assertEqual(body['model'], 'glm-5.3-flash')
             self.assertEqual(body['thinking'], {'type': 'enabled'})
             self.assertEqual(body['reasoning_effort'], 'low')
-            self.assertEqual(body['max_tokens'], 600)
+            self.assertEqual(body['max_tokens'], 600 + THINKING_ALLOWANCE)
             self.assertEqual(body['response_format'], {'type': 'json_object'})
             self.assertEqual(body['messages'][-1]['role'], 'system')
             self.assertIn('not the schema itself', body['messages'][-1]['content'])
@@ -392,3 +398,16 @@ class ProviderTests(unittest.TestCase):
             inputs['ZAI_VISION_MODEL'] = 'glm-4.6v-flashx'
             config = Config.load()
             self.assertEqual((config.model, config.zai_vision_model), ('glm-4.7-flash', 'glm-4.6v-flashx'))
+
+
+class ThinkingBudgetTests(unittest.TestCase):
+    def test_thinking_model_reply_has_room_and_reservation_covers_it(self):
+        helper = ProviderTests()
+        model, store, calls = helper.model(model='glm-5.3-flash')
+        reserved = []
+        store.reserve = lambda amount, budget: reserved.append(amount)
+        model.generate('Cat', [])
+        self.assertEqual(calls[0]['max_tokens'], 600 + THINKING_ALLOWANCE)
+        self.assertEqual(calls[0]['extra_body']['reasoning_effort'], 'low')
+        self.assertEqual(reserved[0], estimate_cost('glm-5.3-flash', calls[0]['messages'][0]['content'], [],
+                                                    600 + THINKING_ALLOWANCE, 'zai'))
