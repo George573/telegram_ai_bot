@@ -1,6 +1,7 @@
 """Independent polling with bounded, ordered workers. Never print exceptions."""
 import signal
 import time
+from pathlib import Path
 from observability import configure_logging, event
 import logging
 from concurrent.futures import ThreadPoolExecutor
@@ -12,6 +13,15 @@ from storage import Store
 from telegram_api import TelegramAPI, TelegramFailure
 
 STOP = False
+HEARTBEAT = Path('/tmp/bot-heartbeat')
+MAX_UPDATE_FAILURES = 3
+
+
+def heartbeat():
+    try:
+        HEARTBEAT.touch()
+    except OSError:
+        pass
 
 
 def stop(*_):
@@ -28,8 +38,10 @@ class ChatScheduler:
     def tick(self, chats):
         for chat_id, future in list(self.active.items()):
             if future.done():
-                future.result()
                 del self.active[chat_id]
+                if future.exception() is not None:
+                    # Never re-raise into the poller: other chats keep working.
+                    event('worker_failed', level=logging.ERROR)
         for chat_id in sorted(chats, key=lambda chat: self.last_scheduled.get(chat, -1)):
             if len(self.active) >= self.limit:
                 break
@@ -56,6 +68,28 @@ def work_chat(config, chat_id, identity, pacer):
         model.provider.client.close()
 
 
+def accept_update(service, store, config, identity, update, failures):
+    """Accept one update; after repeated unexpected failures, skip it instead of exiting."""
+    update_id = update.get('update_id')
+    try:
+        service.accept(update_id, normalize(update, config.chats, identity))
+        failures.pop(update_id, None)
+        return True
+    except TelegramFailure:
+        raise
+    except Exception:
+        count = failures[update_id] = failures.get(update_id, 0) + 1
+        event('update_failed', level=logging.ERROR, update_id=update_id if type(update_id) is int else None,
+              failure_count=count, reason='gave_up' if count >= MAX_UPDATE_FAILURES else 'retry_scheduled')
+        if type(update_id) is not int:
+            return True  # Malformed update: nothing to retry or checkpoint.
+        if count < MAX_UPDATE_FAILURES:
+            return False
+        failures.pop(update_id, None)
+        store.enqueue(update_id, None)  # Advance the checkpoint past this update.
+        return True
+
+
 def main():
     configure_logging()
     signal.signal(signal.SIGTERM, stop)
@@ -75,13 +109,16 @@ def main():
         service = Service(config, store, telegram, Model(config, store),
                           privacy_enabled=not identity.get('can_read_all_group_messages', False))
         stage = 'running'
-        event('bot_started', provider=config.provider, model=config.model, budget_usd=config.budget)
+        event('bot_started', provider=config.provider, model=config.model, budget_usd=config.budget,
+              explicit_search_available=config.provider == 'zai', json_repair_mode='format_only')
         pacer = RequestPacer(config.api_min_interval_seconds)
         next_maintenance = 0.0
+        update_failures = {}
         with ThreadPoolExecutor(max_workers=config.worker_count, thread_name_prefix='chat-worker') as workers:
             scheduler = ChatScheduler(workers, config.worker_count,
                 lambda chat_id: work_chat(config, chat_id, identity, pacer))
             while not STOP:
+                heartbeat()
                 if time.monotonic() >= next_maintenance:
                     store.maintenance(scheduler.active)
                     next_maintenance = time.monotonic() + 60
@@ -90,8 +127,10 @@ def main():
                     updates = telegram.call('getUpdates', offset=store.checkpoint(), limit=100,
                         timeout=1, allowed_updates=['message'])
                     for update in updates:
-                        payload = normalize(update, config.chats, identity)
-                        service.accept(update['update_id'], payload)
+                        if not accept_update(service, store, config, identity, update, update_failures):
+                            # Keep order: retry from this update on the next poll.
+                            time.sleep(1)
+                            break
                 except TelegramFailure as error:
                     if error.code in {401, 409}:
                         event('bot_stopped', level=logging.ERROR, reason='telegram_access', status_code=error.code)
@@ -101,6 +140,7 @@ def main():
                     # Honor the full server delay, but keep shutdown responsive.
                     deadline = time.monotonic() + max(3, error.retry_after or 3)
                     while not STOP and time.monotonic() < deadline:
+                        heartbeat()
                         time.sleep(min(1, max(0, deadline-time.monotonic())))
         event('bot_stopped', reason='shutdown')
         return 0

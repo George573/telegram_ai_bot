@@ -80,6 +80,7 @@ CREATE TABLE rate_limits (
  tokens NUMERIC NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
  PRIMARY KEY(chat_id,subject_id,kind));
 """,
+    "ALTER TABLE jobs ADD COLUMN failures INTEGER NOT NULL DEFAULT 0;",
 )
 
 
@@ -156,26 +157,48 @@ class Store:
         if job.get('admitted'):
             return True
         payload = job['payload']
-        rules = [(0, 'requests', chat_limit), (payload.get('user_id') or -1, 'requests', user_limit)]
+        # Ambient chatter has its own group bucket so it cannot starve directed requests.
+        group_kind = 'requests' if payload.get('directed', True) else 'incidental'
+        rules = [(0, group_kind, chat_limit, 60), (payload.get('user_id') or -1, 'requests', user_limit, 60)]
         if payload.get('media'):
-            rules += [(0, 'media', media_limit * 4), (payload.get('user_id') or -1, 'media', media_limit)]
+            rules += [(0, 'media', media_limit * 4, 60), (payload.get('user_id') or -1, 'media', media_limit, 60)]
         try:
             with self.transaction():
-                self.conn.execute("DELETE FROM rate_limits WHERE updated_at < now()-interval '1 hour'")
-                for subject, kind, capacity in rules:
-                    self.conn.execute('''INSERT INTO rate_limits(chat_id,subject_id,kind,tokens)
-                        VALUES(%s,%s,%s,%s) ON CONFLICT DO NOTHING''', (payload['chat_id'],subject,kind,capacity))
-                    allowed = self.conn.execute('''UPDATE rate_limits SET
-                        tokens=LEAST(%s,tokens+EXTRACT(EPOCH FROM (now()-updated_at))*%s/60)-1,updated_at=now()
-                        WHERE chat_id=%s AND subject_id=%s AND kind=%s
-                        AND LEAST(%s,tokens+EXTRACT(EPOCH FROM (now()-updated_at))*%s/60)>=1
-                        RETURNING tokens''', (capacity,capacity,payload['chat_id'],subject,kind,capacity,capacity)).fetchone()
-                    if allowed is None:
-                        raise RateLimited()
+                self._take(payload['chat_id'], rules)
                 self.conn.execute('UPDATE jobs SET admitted=TRUE WHERE update_id=%s', (job['update_id'],))
             return True
         except RateLimited:
             return False
+
+    def throttle(self, chat_id, subject_id, kind, capacity, period_seconds):
+        """Token bucket for free commands; False when the sender must wait."""
+        try:
+            with self.transaction():
+                self._take(chat_id, [(subject_id or -1, kind, capacity, period_seconds)])
+            return True
+        except RateLimited:
+            return False
+
+    def _take(self, chat_id, rules):
+        # Stale rows are removed by maintenance(), never here: deleting other
+        # chats' rows inside admission could deadlock with concurrent workers.
+        for subject, kind, capacity, period in rules:
+            self.conn.execute('''INSERT INTO rate_limits(chat_id,subject_id,kind,tokens)
+                VALUES(%s,%s,%s,%s) ON CONFLICT DO NOTHING''', (chat_id,subject,kind,capacity))
+            allowed = self.conn.execute('''UPDATE rate_limits SET
+                tokens=LEAST(%s,tokens+EXTRACT(EPOCH FROM (now()-updated_at))*%s/%s)-1,updated_at=now()
+                WHERE chat_id=%s AND subject_id=%s AND kind=%s
+                AND LEAST(%s,tokens+EXTRACT(EPOCH FROM (now()-updated_at))*%s/%s)>=1
+                RETURNING tokens''', (capacity,capacity,period,chat_id,subject,kind,capacity,capacity,period)).fetchone()
+            if allowed is None:
+                raise RateLimited()
+
+    def record_failure(self, update_id, backoff_seconds=30):
+        """Count an unexpected job failure and delay its retry; returns the new count."""
+        row = self.conn.execute('''UPDATE jobs SET failures=failures+1,
+            next_attempt_at=now()+(failures+1)*%s*interval '1 second' WHERE update_id=%s
+            RETURNING failures''', (backoff_seconds, update_id)).fetchone()
+        return row['failures'] if row else 0
 
     def mark_check(self, chat_id):
         self.conn.execute('UPDATE conversations SET last_check=now() WHERE chat_id=%s AND thread_id=%s', (chat_id,self.thread_id))

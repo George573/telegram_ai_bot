@@ -30,6 +30,10 @@ ADMIN_HELP = ('\nSettings managers: /personality, /setprompt <instructions>, /co
 WIZARD_HELP = ('\nDescribe the character in your next reply to me, in any language. '
                'Include names, speaking style, backstory and how often to speak. '
                'I will show a preview before saving. /personality cancel exits; drafts expire after 30 minutes.')
+# Free commands skip AI admission but must not flood Telegram or wipe memory repeatedly.
+FREE_COMMANDS_PER_MINUTE = 5
+FORGETME_PER_HOUR = 2
+MAX_JOB_FAILURES = 3
 PREVIEW_HELP = ('\nPreview only. Send /personality save (or reply “да”) to apply, '
                 '/personality cancel to discard, or reply with a revised description. '
                 'Changing character lore clears conversation memory on save. '
@@ -49,6 +53,13 @@ class Service:
         if payload['anonymous'] or not payload.get('user_id'):
             return False
         return payload['user_id'] in self.config.superadmin_ids or self.telegram.is_admin(payload)
+
+    def throttled(self, payload, kind, capacity, period):
+        throttle = getattr(self.store, 'throttle', None)
+        if throttle is None or throttle(payload['chat_id'], payload.get('user_id'), kind, capacity, period):
+            return False
+        event('command_throttled', level=logging.WARNING)
+        return True
 
     def personality(self, job, argument):
         payload = job['payload']
@@ -158,7 +169,9 @@ class Service:
                         job = self.store.job(update_id)
                         if job:
                             self.command(job)
-                            self.deliver(self.store.job(update_id))
+                            job = self.store.job(update_id)
+                            if job and job['phase'] == 'generated':
+                                self.deliver(job)
                 return
             if command in {'/pause', '/resume'} and self.can_manage(payload):
                 # Polling must be able to stop admission while a worker is
@@ -202,9 +215,15 @@ class Service:
     def command(self, job):
         payload = job['payload']
         chat_id, command, argument = payload['chat_id'], payload['command'], payload['argument'].strip()
+        if command in {'/help', '/whoami', '/forgetme', '/status'} and self.throttled(
+                payload, 'commands', FREE_COMMANDS_PER_MINUTE, 60):
+            self.store.finish(job['update_id'])
+            return
         if command == '/forgetme':
             if payload['anonymous'] or not payload.get('user_id'):
                 self.queue_answer(job, 'Anonymous senders cannot be identified for deletion.')
+            elif self.throttled(payload, 'forgetme', FORGETME_PER_HOUR, 3600):
+                self.queue_answer(job, '/forgetme was used recently. Your earlier request already deleted your messages; try again later.')
             else:
                 self.store.forget_user(chat_id, payload['user_id'], job['update_id'])
                 self.queue_answer(job, 'Your local messages and drafts were deleted. Group summaries and affected pending replies were cleared. Backups and provider copies are separate.')
@@ -325,6 +344,10 @@ class Service:
         paid = payload['command'] not in ADMIN_COMMANDS | {'/help', '/whoami', '/forgetme'}
         if payload['command'] == '/personality':
             paid = payload['argument'].strip().casefold() not in {'', 'save', 'yes', 'да', 'сохранить', 'cancel', 'отмена', 'нет', 'show', 'reset'}
+        if not payload['command'] and (state['paused'] or (state['mode'] == 'directed' and not payload['directed'])):
+            # Ignored turns must not consume the group's request allowance.
+            self.store.finish(job['update_id'])
+            return
         admit = getattr(self.store, 'admit', None)
         if paid and admit and not admit(job, self.config.user_requests_per_minute, self.config.chat_requests_per_minute, self.config.user_media_per_minute):
             self.store.finish(job['update_id'])
@@ -475,7 +498,21 @@ class Service:
             if not acquired:
                 return None
             with scope(job['payload'].get('thread_id')) if scope else nullcontext(), spending(job['payload']['chat_id'], budget) if spending else nullcontext():
-                return self.process_job(job)
+                try:
+                    return self.process_job(job)
+                except Exception:
+                    # One bad job must not stop the bot or crash-loop it after restart.
+                    self.job_failed(job)
+                    return 0
+
+    def job_failed(self, job):
+        record = getattr(self.store, 'record_failure', None)
+        failures = record(job['update_id']) if record else MAX_JOB_FAILURES
+        gave_up = failures >= MAX_JOB_FAILURES
+        event('job_failed', level=logging.ERROR, update_id=job['update_id'], phase=job['phase'],
+              failure_count=failures, reason='gave_up' if gave_up else 'retry_scheduled')
+        if gave_up:
+            self.store.finish(job['update_id'])
 
     def process_job(self, job):
         if job['payload']['chat_id'] not in self.config.chats:
