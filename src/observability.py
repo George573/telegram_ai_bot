@@ -289,5 +289,10 @@ def skill_event(phase, *, request_id, provider, model, name, content=None):
         data['returned_chars'] = len(content)
     elif phase == 'failed':
         data['reason'] = 'skill_loading_failed'
+    current = _CURRENT_JOB.get()
+    if current is not None:
+        # Same job correlation and tally as event(); skill audit lines bypass event().
+        data['update_id'] = current
+        _stats(current).observe(event_name, data)
     LOGGER.log(logging.WARNING if phase == 'failed' else logging.INFO,
                event_name, extra={'event_data': data})

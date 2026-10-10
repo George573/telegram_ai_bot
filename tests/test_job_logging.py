@@ -97,6 +97,15 @@ class JobLoggingTests(unittest.TestCase):
                     self.assertEqual(summaries[0]['outcome'], outcome)
                     self.assertFalse(summaries[0]['directed'])
 
+    def test_skill_audit_events_join_the_job_and_count(self):
+        from observability import skill_event, job_finished
+        with job_context(11):
+            skill_event('returned', request_id='0' * 32, provider='zai', model='glm-4.7', name='city-events', content='x')
+        job_finished(11, 'delivered')
+        returned, = self.records('skill_returned')
+        self.assertEqual(returned['update_id'], 11)
+        self.assertEqual(self.records('reply_finished')[0]['skills_loaded'], 1)
+
     def test_job_context_is_per_thread(self):
         seen = []
         with job_context(9):
