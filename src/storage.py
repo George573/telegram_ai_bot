@@ -291,7 +291,9 @@ class Store:
             self.conn.execute('UPDATE runtime SET next_update=%s,last_update_at=now() WHERE id=1', (update_id + 1,))
 
     def next_job(self, chat_id=None):
-        self.conn.execute("DELETE FROM jobs WHERE created_at < now()-interval '24 hours'")
+        # Only this chat's expired jobs: other chats may be mid-flight in other workers.
+        self.conn.execute("""DELETE FROM jobs WHERE created_at < now()-interval '24 hours'
+            AND (%s::bigint IS NULL OR payload->>'chat_id'=%s)""", (chat_id,str(chat_id) if chat_id is not None else None))
         return self.conn.execute('''SELECT j.* FROM jobs j
             WHERE j.next_attempt_at <= now() AND (%s::bigint IS NULL OR j.payload->>'chat_id'=%s)
             AND NOT EXISTS (
