@@ -17,7 +17,7 @@ class PostgresTests(unittest.TestCase):
     def setUp(self):
         self.conn=psycopg.connect('host=db dbname=roleplay user=roleplay password=test-only-password',autocommit=True,row_factory=dict_row)
         self.store=Store(50,self.conn)
-        self.conn.execute('TRUNCATE messages, chats, jobs CASCADE')
+        self.conn.execute('TRUNCATE messages, chats, jobs, rate_limits CASCADE')
         self.conn.execute('UPDATE runtime SET next_update=0,spent=0')
     def tearDown(self): self.conn.close()
     def test_atomic_checkpoint_and_deduplication(self):
@@ -250,6 +250,55 @@ class PostgresTests(unittest.TestCase):
         self.assertEqual([r['content'] for r in self.store.messages(-1)], ['Keep me'])
         self.assertEqual(self.store.state(-1)['summary'], '')
         self.assertIsNone(self.store.next_job())
+
+    def test_forget_user_keeps_bot_replies_but_clears_legacy_user_rows(self):
+        self.store.state(-1)
+        self.store.append(-1, 'user', 'Legacy unknown sender')
+        self.store.append(-1, 'assistant', 'Bot reply')
+        self.store.append(-1, 'user', 'Delete me', sender_id=10)
+        self.store.forget_user(-1, 10, 2)
+        self.assertEqual([r['content'] for r in self.store.messages(-1)], ['Bot reply'])
+
+    def test_throttle_bucket_limits_then_refills(self):
+        self.store.state(-1)
+        self.assertTrue(self.store.throttle(-1, 10, 'forgetme', 2, 3600))
+        self.assertTrue(self.store.throttle(-1, 10, 'forgetme', 2, 3600))
+        self.assertFalse(self.store.throttle(-1, 10, 'forgetme', 2, 3600))
+        self.assertTrue(self.store.throttle(-1, 11, 'forgetme', 2, 3600))
+        self.conn.execute("UPDATE rate_limits SET updated_at=now()-interval '1 hour' WHERE subject_id=10")
+        self.assertTrue(self.store.throttle(-1, 10, 'forgetme', 2, 3600))
+
+    def test_incidental_admission_has_separate_group_bucket(self):
+        self.store.state(-1)
+        for update_id in range(1, 4):
+            self.store.enqueue(update_id, {'chat_id': -1, 'user_id': update_id, 'directed': False})
+        jobs = [self.store.job(update_id) for update_id in range(1, 4)]
+        self.assertTrue(self.store.admit(jobs[0], user_limit=5, chat_limit=1))
+        self.assertFalse(self.store.admit(jobs[1], user_limit=5, chat_limit=1))
+        self.store.enqueue(4, {'chat_id': -1, 'user_id': 4, 'directed': True})
+        self.assertTrue(self.store.admit(self.store.job(4), user_limit=5, chat_limit=1))
+
+    def test_admission_does_not_touch_other_chats_rate_rows(self):
+        self.store.state(-1); self.store.state(-2)
+        self.conn.execute("INSERT INTO rate_limits(chat_id,subject_id,kind,tokens,updated_at) VALUES(-2,0,'requests',1,now()-interval '2 hours')")
+        self.store.enqueue(1, {'chat_id': -1, 'user_id': 10, 'directed': True})
+        self.assertTrue(self.store.admit(self.store.job(1)))
+        self.assertEqual(self.conn.execute('SELECT count(*) AS n FROM rate_limits WHERE chat_id=-2').fetchone()['n'], 1)
+        self.store.maintenance()
+        self.assertEqual(self.conn.execute('SELECT count(*) AS n FROM rate_limits WHERE chat_id=-2').fetchone()['n'], 0)
+
+    def test_record_failure_counts_and_delays_retry(self):
+        self.store.enqueue(1, {'chat_id': -1})
+        self.assertEqual(self.store.record_failure(1), 1)
+        self.assertIsNone(self.store.next_job(-1))
+        self.assertEqual(self.store.record_failure(1), 2)
+        self.assertEqual(self.store.record_failure(999), 0)
+
+    def test_next_job_only_expires_its_own_chat(self):
+        self.store.enqueue(1, {'chat_id': -1}); self.store.enqueue(2, {'chat_id': -2})
+        self.conn.execute("UPDATE jobs SET created_at=now()-interval '2 days'")
+        self.assertIsNone(self.store.next_job(-1))
+        self.assertIsNotNone(self.store.job(2))
 
     def test_drafts_persist_scope_and_expire_without_changing_character(self):
         from personality import DEFAULTS
