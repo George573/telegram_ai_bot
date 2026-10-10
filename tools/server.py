@@ -1,6 +1,8 @@
 """Custom tool service. Holds no bot secrets; reachable only from the bot's private network.
 
 POST /v1/yandex-reviews {"url": "<Maps card>"} -> review sample or explicit unavailable status.
+POST /v1/afisha-listing {"category", "date_from", "days"} -> Moscow Afisha events.
+POST /v1/afisha-event {"url": "<Afisha event page>"} -> event details and sessions.
 GET /healthz -> {"status": "ok"}.
 """
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -11,6 +13,8 @@ import threading
 import time
 from yandex_reviews import card_url, unavailable
 from review_browser import read_reviews
+import yandex_afisha
+from afisha_browser import read_event, read_listing
 
 MAX_BODY = 2048
 # One Chromium at a time keeps the container inside its memory limit.
@@ -23,24 +27,52 @@ def log(name, **fields):
     print(json.dumps({'event': name, **fields}), file=sys.stdout, flush=True)
 
 
-def reviews(body):
-    try:
-        request = json.loads(body)
-        if not isinstance(request, dict) or set(request) != {'url'}:
-            raise ValueError
-        url = card_url(request['url'])
-    except (ValueError, TypeError):
-        return 400, {'status': 'unavailable', 'reason': 'invalid_url', 'reviews': [], 'returned_count': 0}
+def _browse(name, url, reader, busy):
     if not BROWSER_SLOTS.acquire(timeout=BUSY_WAIT_SECONDS):
-        return 200, unavailable(url, 'busy')
+        return 200, busy(url, 'busy')
     started = time.monotonic()
     try:
-        result = read_reviews(url)
+        result = reader(url)
     finally:
         BROWSER_SLOTS.release()
-    log('reviews_read', status=result['status'], reason=result.get('reason'),
-        review_count=result['returned_count'], duration_ms=int((time.monotonic() - started) * 1000))
+    log(name, status=result['status'], reason=result.get('reason'),
+        returned_count=result['returned_count'], duration_ms=int((time.monotonic() - started) * 1000))
     return 200, result
+
+
+def _request(body, keys):
+    request = json.loads(body)
+    if not isinstance(request, dict) or set(request) != keys:
+        raise ValueError
+    return request
+
+
+def reviews(body):
+    try:
+        url = card_url(_request(body, {'url'})['url'])
+    except (ValueError, TypeError):
+        return 400, {'status': 'unavailable', 'reason': 'invalid_url', 'reviews': [], 'returned_count': 0}
+    return _browse('reviews_read', url, read_reviews, unavailable)
+
+
+def afisha_listing(body):
+    try:
+        request = _request(body, {'category', 'date_from', 'days'})
+        url = yandex_afisha.listing_url(request['category'], request['date_from'], request['days'])
+    except (ValueError, TypeError):
+        return 400, yandex_afisha.unavailable(None, 'invalid_arguments')
+    return _browse('afisha_listing_read', url, read_listing, yandex_afisha.unavailable)
+
+
+def afisha_event(body):
+    try:
+        url = yandex_afisha.event_url(_request(body, {'url'})['url'])
+    except (ValueError, TypeError):
+        return 400, yandex_afisha.unavailable(None, 'invalid_url')
+    return _browse('afisha_event_read', url, read_event, yandex_afisha.unavailable)
+
+
+ROUTES = {'/v1/yandex-reviews': reviews, '/v1/afisha-listing': afisha_listing, '/v1/afisha-event': afisha_event}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -65,7 +97,8 @@ class Handler(BaseHTTPRequestHandler):
             self.reply(404, {'status': 'not_found'})
 
     def do_POST(self):
-        if self.path != '/v1/yandex-reviews':
+        handler = ROUTES.get(self.path)
+        if handler is None:
             self.reply(404, {'status': 'not_found'})
             return
         try:
@@ -76,9 +109,9 @@ class Handler(BaseHTTPRequestHandler):
             self.reply(413 if length > MAX_BODY else 400, {'status': 'invalid_request'})
             return
         try:
-            self.reply(*reviews(self.rfile.read(length)))
+            self.reply(*handler(self.rfile.read(length)))
         except Exception:
-            log('tool_failed', tool='yandex_reviews')
+            log('tool_failed', path=self.path)
             self.reply(500, {'status': 'unavailable', 'reason': 'tool_failed', 'reviews': [], 'returned_count': 0})
 
 
