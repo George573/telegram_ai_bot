@@ -40,6 +40,9 @@ class ClientTests(unittest.TestCase):
         self.assertNotIn('fake-secret',str(caught.exception))
         self.assertGreater(allowance.total,0)
     def telegram(self, handler):
+        import telegram_api
+        telegram_api._admin_cache.clear()
+        self.addCleanup(telegram_api._admin_cache.clear)
         api=TelegramAPI('fake-telegram-token')
         api._http.close()
         api._http=httpx.Client(transport=httpx.MockTransport(handler))
@@ -55,6 +58,32 @@ class ClientTests(unittest.TestCase):
     def test_failed_admin_lookup_denies_change(self):
         api=self.telegram(lambda _: httpx.Response(403,json={'ok':False,'error_code':403}))
         self.assertFalse(api.is_admin(dict(chat_id=-1,user_id=10,anonymous=False)))
+    def test_transient_admin_lookup_failure_is_unknown_not_denied(self):
+        for response in (httpx.Response(429,json={'ok':False,'error_code':429,'parameters':{'retry_after':3}}),
+                         httpx.Response(502,text='bad gateway')):
+            with self.subTest(status=response.status_code):
+                api=self.telegram(lambda _: response)
+                self.assertIsNone(api.is_admin(dict(chat_id=-1,user_id=10,anonymous=False)))
+    def test_admin_list_is_cached_across_clients(self):
+        calls=[]
+        def handler(request):
+            calls.append(request)
+            return httpx.Response(200,json={'ok':True,'result':[{'user':{'id':10},'status':'creator'}]})
+        first=self.telegram(handler)
+        self.assertTrue(first.is_admin(dict(chat_id=-1,user_id=10,anonymous=False)))
+        second=TelegramAPI('fake-telegram-token'); second._http.close()
+        second._http=httpx.Client(transport=httpx.MockTransport(handler)); self.addCleanup(second._http.close)
+        self.assertFalse(second.is_admin(dict(chat_id=-1,user_id=11,anonymous=False)))
+        self.assertEqual(len(calls),1)
+    def test_connect_failure_is_marked_not_sent(self):
+        def handler(request): raise httpx.ConnectError('synthetic')
+        with self.assertRaises(TelegramFailure) as caught:
+            self.telegram(handler).call('sendMessage',chat_id=-1,text='x')
+        self.assertTrue(caught.exception.not_sent)
+        def timeout(request): raise httpx.ReadTimeout('synthetic')
+        with self.assertRaises(TelegramFailure) as caught:
+            self.telegram(timeout).call('sendMessage',chat_id=-1,text='x')
+        self.assertFalse(caught.exception.not_sent)
     def test_http_errors_do_not_expose_telegram_url(self):
         def handler(request): raise httpx.ConnectError(str(request.url))
         api=self.telegram(handler)
@@ -149,6 +178,7 @@ class ClientTests(unittest.TestCase):
             body = json.loads(request.content)
             self.assertEqual(body['max_tool_calls'], 1)
             self.assertEqual(body['tools'][0]['type'], 'web_search')
+            self.assertEqual(body['tool_choice'], 'required')
             return httpx.Response(200, json={'id': 'resp_fake', 'object': 'response', 'created_at': 1,
                 'model': 'gpt-6-luna', 'status': 'completed', 'error': None, 'incomplete_details': None,
                 'output': [{'type': 'message', 'id': 'msg_fake', 'role': 'assistant', 'status': 'completed',
@@ -158,6 +188,6 @@ class ClientTests(unittest.TestCase):
         self.addCleanup(http.close)
         client = OpenAI(api_key='fake-key', http_client=http, max_retries=0)
         model = Model(Config('fake', 'fake', frozenset({-1})), Allowance(), client)
-        self.assertEqual(model.generate('Cat', [], allow_search=True), 'Hello')
+        self.assertEqual(model.generate('Cat', [], allow_search=True, require_search=True), 'Hello')
         self.assertEqual(model.transcribe(b'fake-wav', 1), 'Hello')
         self.assertEqual(len(requests), 2)

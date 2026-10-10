@@ -1,5 +1,6 @@
 import re
 import threading
+import time
 import logging
 from contextlib import contextmanager
 from observability import event
@@ -7,10 +8,18 @@ import httpx
 
 
 class TelegramFailure(Exception):
-    def __init__(self, code=0, retry_after=0):
+    def __init__(self, code=0, retry_after=0, not_sent=False):
         super().__init__('Telegram request failed')
         self.code = code
         self.retry_after = retry_after
+        # True only when the request certainly never reached Telegram (connect failure).
+        self.not_sent = not_sent
+
+
+# Shared by poller and worker clients: repeated commands must not flood getChatAdministrators.
+ADMIN_CACHE_SECONDS = 60
+_admin_cache = {}
+_admin_cache_lock = threading.Lock()
 
 
 class TelegramAPI:
@@ -28,6 +37,8 @@ class TelegramAPI:
             return body['result']
         except TelegramFailure:
             raise
+        except (httpx.ConnectError, httpx.ConnectTimeout):
+            raise TelegramFailure(not_sent=True) from None
         except Exception:
             # No raw HTTP exceptions: URLs include the bot credential.
             raise TelegramFailure() from None
@@ -101,11 +112,21 @@ class TelegramAPI:
         return self.call('sendMessage', **params)
 
     def is_admin(self, job):
+        """True/False when known; None when Telegram could not be asked."""
         if job['anonymous'] or not job.get('user_id'):
             return False
-        try:
-            members = self.call('getChatAdministrators', chat_id=job['chat_id'])
-            return any(member.get('user', {}).get('id') == job['user_id'] and
-                member.get('status') in {'creator', 'administrator'} for member in members)
-        except TelegramFailure:
-            return False
+        with _admin_cache_lock:
+            cached = _admin_cache.get(job['chat_id'])
+        if cached and time.monotonic() - cached[0] < ADMIN_CACHE_SECONDS:
+            admins = cached[1]
+        else:
+            try:
+                members = self.call('getChatAdministrators', chat_id=job['chat_id'])
+            except TelegramFailure as error:
+                # A definite refusal (e.g. 400/403) denies; transient failures are unknown.
+                return False if 400 <= error.code < 429 else None
+            admins = frozenset(member.get('user', {}).get('id') for member in members
+                               if member.get('status') in {'creator', 'administrator'})
+            with _admin_cache_lock:
+                _admin_cache[job['chat_id']] = (time.monotonic(), admins)
+        return job['user_id'] in admins

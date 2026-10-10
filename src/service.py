@@ -50,6 +50,7 @@ class Service:
         return typing(payload) if typing else nullcontext()
 
     def can_manage(self, payload):
+        """True/False, or None when Telegram could not confirm admin status."""
         if payload['anonymous'] or not payload.get('user_id'):
             return False
         return payload['user_id'] in self.config.superadmin_ids or self.telegram.is_admin(payload)
@@ -239,7 +240,12 @@ class Service:
                 text += ADMIN_HELP
             self.queue_answer(job, text)
             return
-        if not self.can_manage(payload):
+        allowed = self.can_manage(payload)
+        if allowed is None:
+            # Unknown is not "not an admin": keep drafts and ask for a retry.
+            self.queue_answer(job, 'Could not verify admin status with Telegram. Please try again shortly.')
+            return
+        if not allowed:
             if payload.get('user_id') and not payload['anonymous']:
                 self.store.delete_drafts(chat_id, payload['user_id'])
             self.queue_answer(job, 'This command requires an identifiable group admin or configured bot super admin.')
@@ -471,9 +477,9 @@ class Service:
         except TelegramFailure as error:
             event('delivery_failed', level=logging.WARNING, update_id=job['update_id'],
                   status_code=error.code, retry_after=error.retry_after)
-            if error.code == 429 and job.get('delivery_attempts', 0) < 5:
-                # Explicit rate-limit rejection means Telegram did not accept the message.
-                self.store.retry_delivery(job, max(1, error.retry_after))
+            if (error.code == 429 or error.not_sent) and job.get('delivery_attempts', 0) < 5:
+                # Explicit rate-limit rejection or a failed connection means Telegram did not accept the message.
+                self.store.retry_delivery(job, max(1, error.retry_after or 5 * (job.get('delivery_attempts', 0) + 1)))
                 return 0
             self.store.finish(job['update_id'])
             return 0
