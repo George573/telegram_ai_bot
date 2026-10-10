@@ -28,20 +28,47 @@ services:
       PGDATABASE: roleplay
       PGUSER: roleplay
       PGPASSWORD: ${BOT_DB_PASSWORD:?Set BOT_DB_PASSWORD in .env}
+      TOOLS_URL: http://tools:8080
+      MAX_INPUT_CHARS: ${MAX_INPUT_CHARS:-30000}
+      MAX_TOOL_CHARS: ${MAX_TOOL_CHARS:-40000}
     depends_on:
       db:
         condition: service_healthy
-    networks: [backend, egress]
+      tools:
+        # Replies still work without the reviews tool; it reports unavailable.
+        condition: service_started
+    networks: [backend, egress, tools]
     restart: unless-stopped
-    mem_limit: ${BOT_MEMORY_LIMIT:-512m}
+    mem_limit: ${BOT_MEMORY_LIMIT:-768m}
     cpus: ${BOT_CPU_LIMIT:-1.0}
-    pids_limit: 128
+    pids_limit: 256
     read_only: true
     tmpfs:
-      - /tmp:size=16m,mode=1777
+      - /tmp:size=128m,mode=1777
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
     stop_grace_period: 60s
+    logging:
+      driver: local
+      options:
+        max-size: 5m
+        max-file: "2"
+  tools:
+    # Custom tools (headless Chromium for Maps reviews). No secrets, no database access.
+    build:
+      context: .
+      dockerfile: tools/Dockerfile
+    networks: [tools, tools_egress]
+    restart: unless-stopped
+    mem_limit: ${TOOLS_MEMORY_LIMIT:-768m}
+    cpus: ${TOOLS_CPU_LIMIT:-1.0}
+    pids_limit: 256
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    shm_size: 64m
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
     logging:
       driver: local
       options:
@@ -81,3 +108,7 @@ networks:
   backend:
     internal: true
   egress:
+  # Bot <-> tools only; the bot does not listen, tools cannot reach the database.
+  tools:
+    internal: true
+  tools_egress:

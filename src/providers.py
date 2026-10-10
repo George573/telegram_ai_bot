@@ -9,6 +9,8 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from urllib.parse import urlsplit
 from openai import OpenAI
+from nearby_places import LOAD_SKILL
+from yandex_reviews import READ_YANDEX_REVIEWS
 
 PRICES = {
     'openai': {'gpt-6-luna': (Decimal('0.10'), Decimal('0.50')),
@@ -30,6 +32,11 @@ VOICE_MAX_SECONDS = {'openai': 300, 'zai': 30}
 TRANSCRIPTION_RATES = {'openai': Decimal('0.0045'), 'zai': Decimal('0.0024')}
 IMAGE_MAX_BYTES = {'openai': 10 * 1024 * 1024, 'zai': 5 * 1024 * 1024}
 WEB_CALL_COST = Decimal('0.01')
+SEARCH_WEB = {'name': 'search_web',
+    'description': 'Search the public web now and return titles, URLs and evidence snippets. '
+                   'Use this for current places, cafes, exhibitions and factual lookups; never ask the user to run /search.',
+    'parameters': {'type': 'object', 'properties': {'query': {'type': 'string', 'minLength': 1, 'maxLength': 400}},
+                   'required': ['query'], 'additionalProperties': False}}
 TRANSCRIPTION_PER_MINUTE = TRANSCRIPTION_RATES['openai']
 
 
@@ -115,6 +122,17 @@ class Generation:
     sources: tuple = ()
     search_calls: int = 0
     search_fee: Decimal | None = None
+    tool_calls: tuple = ()
+    continuation: tuple = ()
+    finish_reason: str | None = None
+    incomplete_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class ToolCall:
+    call_id: str
+    name: str
+    arguments: str
 
 
 def member(item, name, default=None):
@@ -163,7 +181,8 @@ class OpenAIProvider:
         return instructions
 
     def generate(self, *, model, instructions, history, output_tokens,
-                 response_format=None, allow_search=False, image=None):
+                 response_format=None, allow_search=False, image=None, require_search=False,
+                 skill_enabled=False, continuation=(), reviews_enabled=False):
         extra = {'text': {'format': response_format}} if response_format else {}
         if image is not None:
             encoded = base64.b64encode(image).decode('ascii')
@@ -171,15 +190,30 @@ class OpenAIProvider:
                 {'type': 'input_image', 'image_url': 'data:image/jpeg;base64,' + encoded, 'detail': 'low'}]}]
         if allow_search:
             extra.update(tools=[{'type': 'web_search', 'search_context_size': 'low'}],
-                         tool_choice='auto', max_tool_calls=1)
+                         tool_choice='required' if require_search else 'auto', max_tool_calls=1)
+        if skill_enabled:
+            extra.setdefault('tools', []).append({'type': 'function', **LOAD_SKILL, 'strict': True})
+            extra['parallel_tool_calls'] = False
+        if reviews_enabled:
+            extra.setdefault('tools', []).append({'type': 'function', **READ_YANDEX_REVIEWS, 'strict': True})
         response = self.client.responses.create(model=model, instructions=instructions,
-            input=history, store=False, reasoning={'effort': 'none'},
+            input=history + list(continuation), store=False, reasoning={'effort': 'none'},
             max_output_tokens=output_tokens, **extra)
         usage = response.usage
+        output = member(response, 'output', []) or []
+        calls = tuple(ToolCall(member(item, 'call_id'), member(item, 'name'), member(item, 'arguments'))
+                      for item in output if member(item, 'type') == 'function_call')
+        carried = tuple(item if isinstance(item, dict) else item.model_dump(exclude_none=True)
+                        for item in output) if calls else ()
         return Generation(response.output_text, response.status == 'completed',
             usage.input_tokens if usage else None, usage.output_tokens if usage else None,
             tuple(citation_sources(response)) if allow_search else (),
-            sum(member(item, 'type') == 'web_search_call' for item in member(response, 'output', []) or []))
+            sum(member(item, 'type') == 'web_search_call' for item in output),
+            tool_calls=calls, continuation=carried, finish_reason=response.status,
+            incomplete_reason=member(member(response, 'incomplete_details'), 'reason'))
+
+    def skill_result(self, call, text):
+        return {'type': 'function_call_output', 'call_id': call.call_id, 'output': text}
 
     def transcribe(self, wav):
         return self.client.audio.transcriptions.create(model='gpt-transcribe',
@@ -203,7 +237,8 @@ class ZaiProvider:
         return instructions
 
     def generate(self, *, model, instructions, history, output_tokens,
-                 response_format=None, allow_search=False, image=None):
+                 response_format=None, allow_search=False, image=None, require_search=False,
+                 skill_enabled=False, continuation=(), reviews_enabled=False):
         if image is not None:
             if model not in VISION_PRICES or len(image) > IMAGE_MAX_BYTES['zai']:
                 raise ProviderFailure('Unsupported or oversized image')
@@ -215,12 +250,20 @@ class ZaiProvider:
         if allow_search:
             extra['tools'] = [{'type': 'web_search', 'web_search': {
                 'enable': True, 'search_engine': 'search-prime', 'search_result': True,
-                'count': 3, 'content_size': 'low'}}]
+                'count': 3, 'content_size': 'low'}}, {'type': 'function', 'function': SEARCH_WEB}]
+        if skill_enabled:
+            # Keep skill discovery first among local functions.
+            extra.setdefault('tools', []).insert(1 if allow_search else 0, {'type': 'function', 'function': LOAD_SKILL})
+        if reviews_enabled:
+            extra.setdefault('tools', []).append({'type': 'function', 'function': READ_YANDEX_REVIEWS})
+        if allow_search or skill_enabled:
+            instructions += ('\nYou may call multiple functions in one response; each call receives a result. For explicit public lookup call search_web '
+                '(not a function named web_search). After load_skill returns its instructions, do not load it again.')
         if response_format:
             # Z.ai supports JSON mode, not OpenAI's strict schema format.
             # Shared Model validation still checks the resulting object.
             extra['response_format'] = {'type': 'json_object'}
-        messages = [{'role': 'system', 'content': instructions}] + history
+        messages = [{'role': 'system', 'content': instructions}] + history + list(continuation)
         extra_body = {'thinking': {'type': 'enabled' if model == 'glm-5.3-flash' else 'disabled'}}
         if response_format and model == 'glm-5.3-flash':
             # This model requires thinking; max effort can exhaust small output
@@ -240,13 +283,45 @@ class ZaiProvider:
         if len(response.choices) != 1:
             raise ProviderFailure('Invalid provider response')
         choice, usage = response.choices[0], response.usage
+        calls = tuple(ToolCall(member(item, 'id'), member(member(item, 'function'), 'name'),
+                               member(member(item, 'function'), 'arguments'))
+                      for item in member(choice.message, 'tool_calls', []) or [])
+        carried = ({'role': 'assistant', 'content': choice.message.content,
+                    'tool_calls': [{'id': call.call_id, 'type': 'function', 'function': {
+                        'name': call.name, 'arguments': call.arguments}} for call in calls]},) if calls else ()
+        if carried and member(choice.message, 'reasoning_content') is not None:
+            carried[0]['reasoning_content'] = member(choice.message, 'reasoning_content')
         results = (member(response, 'web_search', []) or []) if allow_search else []
         annotations = [{'type': 'url_citation', 'title': member(item, 'title', 'Source'),
                         'url': member(item, 'link', '')} for item in results]
         sources = citation_sources({'output': [{'type': 'message', 'content': [{'annotations': annotations}]}]})
-        return Generation(choice.message.content or '', choice.finish_reason == 'stop',
+        return Generation(choice.message.content or '',
+            choice.finish_reason == 'stop' or (choice.finish_reason == 'tool_calls' and bool(calls)),
             usage.prompt_tokens if usage else None, usage.completion_tokens if usage else None,
-            tuple(sources), int(bool(results)), WEB_CALL_COST if allow_search else Decimal('0'))
+            tuple(sources), int(bool(results)), WEB_CALL_COST if allow_search else Decimal('0'), calls, carried,
+            finish_reason=choice.finish_reason)
+
+    def skill_result(self, call, text):
+        return {'role': 'tool', 'tool_call_id': call.call_id, 'content': text}
+
+    def search(self, query):
+        # Use the configured Z.ai client/key/base URL; no alternate provider.
+        response = self.client.post('/web_search', cast_to=dict[str, object], body={
+            'search_engine': 'search-prime', 'search_query': query, 'count': 5})
+        if not isinstance(response, dict) or not isinstance(response.get('search_result'), list):
+            raise ProviderFailure('Invalid search response')
+        results = []
+        for item in response['search_result'][:5]:
+            if not isinstance(item, dict):
+                continue
+            safe = citation_sources({'output': [{'type': 'message', 'content': [{'annotations': [
+                {'type': 'url_citation', 'url': item.get('link'), 'title': item.get('title', 'Source')}]}]}]})
+            if not safe or any(existing['url'] == safe[0][1] for existing in results):
+                continue
+            results.append({'title': safe[0][0], 'url': safe[0][1],
+                            'content': str(item.get('content') or '')[:2000],
+                            'publish_date': str(item.get('publish_date') or '')[:40]})
+        return results
 
     def transcribe(self, wav):
         return self.client.audio.transcriptions.create(model='glm-asr-2512',

@@ -128,7 +128,11 @@ class ProviderTests(unittest.TestCase):
             self.assertEqual(body['response_format'], {'type': 'json_object'})
             self.assertEqual(body['messages'][-1]['role'], 'system')
             self.assertIn('not the schema itself', body['messages'][-1]['content'])
-            self.assertEqual(body['messages'][-2]['content'], 'Hello, Cat!')
+            if len(requests) == 1:
+                self.assertEqual(body['messages'][-2]['content'], 'Hello, Cat!')
+            else:
+                self.assertEqual(body['messages'][-3], {'role': 'assistant', 'content': 'plain reply'})
+                self.assertIn('expected_value', body['messages'][-2]['content'])
             content = 'plain reply' if len(requests) == 1 else '{"respond":true,"reply":"Hello"}'
             return httpx.Response(200, json={'id': 'synthetic', 'object': 'chat.completion',
                 'created': 1, 'model': 'glm-5.3-flash', 'choices': [{'index': 0,
@@ -240,6 +244,19 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertNotIn('tools', calls[0])
         self.assertEqual(allowance.total, 0)
+
+    def test_service_zai_natural_lookup_enables_native_search(self):
+        store, telegram = MemoryStore(), FakeTelegram()
+        store.chat['web_enabled'] = True
+        model, allowance, calls = self.model()
+        service = Service(self.config(), store, telegram, model)
+        service.accept(1, payload('/chat find current exhibitions'))
+        for _ in range(3): service.process_one()
+        self.assertEqual(calls[0]['tools'][0]['type'], 'web_search')
+        self.assertTrue(calls[0]['tools'][0]['web_search']['enable'])
+        self.assertEqual(telegram.sent[-1], 'Hello')
+        self.assertEqual(store.rows[-1]['role'], 'assistant')
+        self.assertGreaterEqual(allowance.total, Decimal('0.01'))
 
     def test_zai_vision_sdk_request_uses_photo_model_and_its_prices(self):
         import base64

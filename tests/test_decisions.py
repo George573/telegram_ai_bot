@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 import sys
+import json
 import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 from config import Config
@@ -41,7 +42,10 @@ class DecisionTests(unittest.TestCase):
                 self.assertEqual(model.decide_reply('Cat', []), 'Hello')
             self.assertEqual(len(calls), 2)
             instructions = calls[1]['messages'][0]['content'] if provider == 'zai' else calls[1]['instructions']
-            self.assertIn('Include both required keys', instructions)
+            sent = calls[1]['messages'] if provider == 'zai' else calls[1]['input']
+            self.assertIn('Include both required keys', sent[-1]['content'])
+            self.assertEqual(sent[-2], {'role': 'assistant', 'content': '{"answer":"private-rejected-answer"}'})
+            self.assertIn('missing_fields', sent[-1]['content'])
             self.assertIn('{"respond":false,"reply":""}', instructions)
             self.assertNotIn('private-rejected-answer', instructions)
             self.assertNotIn('private-rejected-answer', str(log.call_args_list))
@@ -73,9 +77,9 @@ class DecisionTests(unittest.TestCase):
                 model, calls = self.model([text])
                 with patch('model.event') as log:
                     with self.assertRaises(ModelFailure): model.decide_reply('Cat', [])
-                self.assertEqual(len(calls), 2)
+                self.assertEqual(len(calls), 4)
                 invalid = [c for c in log.call_args_list if c.args[0] == 'ai_output_invalid']
-                self.assertEqual(len(invalid), 2)
+                self.assertEqual(len(invalid), 4)
                 self.assertTrue(all(c.kwargs['validation_error'] == category for c in invalid))
 
     def test_budget_rejection_blocks_corrective_call(self):
@@ -100,13 +104,16 @@ class DecisionTests(unittest.TestCase):
             self.assertEqual(model.decide_reply('Cat', []), 'Hello')
         sleep.assert_called_once_with(2)
 
-    def test_repair_has_no_extra_search_or_discarded_citations(self):
+    def test_repair_disables_tools_and_preserves_existing_search_sources(self):
         model, _ = self.model([])
         with patch.object(model, 'generate', side_effect=[ModelText('bad', [('private', 'https://example.com')]),
                             ModelText('{"respond":true,"reply":"Hello"}', [])]) as generate:
-            self.assertEqual(model.decide_reply('Cat', [], allow_search=True), 'Hello')
+            self.assertIn('https://example.com', model.decide_reply('Cat', [], allow_search=True))
         self.assertTrue(generate.call_args_list[0].kwargs['allow_search'])
         self.assertFalse(generate.call_args_list[1].kwargs['allow_search'])
+        self.assertIn('formatting repair only', generate.call_args_list[1].args[0])
+        self.assertNotIn('No search tool is available', generate.call_args_list[1].args[0])
+        self.assertIn('Do not ask the user to run /search', generate.call_args_list[1].args[0])
 
     def test_network_failure_does_not_trigger_json_repair(self):
         model, calls = self.model([RuntimeError('synthetic-secret')])
@@ -125,7 +132,59 @@ class DecisionTests(unittest.TestCase):
         service.generate(store.next_job())
         self.assertIsNone(store.next_job())
         self.assertEqual(service.telegram.sent, [])
+        self.assertEqual(len(calls), 4)
+
+    def test_third_repair_succeeds_and_receives_latest_answer_and_error(self):
+        outputs = ['private-first', '{"respond":true}', '{"respond":"true","reply":"private-third"}',
+                   '{"respond":true,"reply":"Fixed"}']
+        history = [{'role': 'user', 'content': 'Original request'}]
+        for provider in ('openai', 'zai'):
+            with self.subTest(provider=provider):
+                model, calls = self.model(outputs, provider)
+                with patch('model.event') as log:
+                    self.assertEqual(model.decide_reply('Cat', history), 'Fixed')
+                self.assertEqual(len(calls), 4)
+                for index, category in enumerate(('malformed_json', 'missing_fields', 'wrong_types'), 1):
+                    messages = calls[index]['input' if provider == 'openai' else 'messages']
+                    self.assertEqual(messages[-2], {'role': 'assistant', 'content': outputs[index - 1]})
+                    feedback = json.loads(messages[-1]['content'].split('\n', 1)[1])
+                    self.assertEqual(feedback['validation_error'], category)
+                    self.assertIn('Repair your previous answer', feedback['instruction'])
+                    self.assertEqual(len(messages), 3 if provider == 'openai' else 4)
+                    if index == 1:
+                        self.assertEqual(feedback['error_position'], 0)
+                        self.assertEqual(feedback['error_line'], 1)
+                started = [call.kwargs for call in log.call_args_list if call.args[0] == 'ai_json_repair_started']
+                self.assertEqual([item['repair_attempt'] for item in started], [1, 2, 3])
+                completed = [call.kwargs for call in log.call_args_list if call.args[0] == 'ai_json_repair_completed']
+                self.assertEqual(completed[0]['repair_attempt'], 3)
+                self.assertEqual(len({item['json_request_id'] for item in started + completed}), 1)
+                self.assertNotIn('private-first', str(log.call_args_list))
+                self.assertNotIn('private-third', str(log.call_args_list))
+        self.assertEqual(history, [{'role': 'user', 'content': 'Original request'}])
+
+    def test_character_settings_use_same_repair_and_validation(self):
+        from personality import DEFAULTS
+        outputs = ['private-malformed', json.dumps({**DEFAULTS, 'eagerness': 'invalid'}), json.dumps(DEFAULTS)]
+        for provider in ('openai', 'zai'):
+            with self.subTest(provider=provider):
+                model, calls = self.model(outputs, provider)
+                with patch('model.event') as log:
+                    self.assertEqual(model.infer_personality('Cat', DEFAULTS), DEFAULTS)
+                self.assertEqual(len(calls), 3)
+                repair = [call.kwargs for call in log.call_args_list if call.args[0] == 'ai_json_repair_started']
+                self.assertEqual([item['validation_error'] for item in repair], ['malformed_json', 'invalid_settings'])
+                self.assertTrue(all(item['schema_name'] == 'character_settings' for item in repair))
+
+    def test_request_failure_during_repair_is_logged_and_stops(self):
+        model, calls = self.model(['bad', RuntimeError('synthetic-secret')])
+        with patch('model.event') as log:
+            with self.assertRaises(ModelFailure):
+                model.decide_reply('Cat', [])
         self.assertEqual(len(calls), 2)
+        failed = [call.kwargs for call in log.call_args_list if call.args[0] == 'ai_json_repair_failed']
+        self.assertEqual(failed[-1]['reason'], 'request_failed')
+        self.assertNotIn('synthetic-secret', str(log.call_args_list))
         self.assertNotIn('Respond only with a short conversational reply', calls[0]['messages'][0]['content'])
 
     def test_only_whole_json_fences_and_leading_bom_are_normalized(self):

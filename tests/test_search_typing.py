@@ -20,6 +20,267 @@ from test_service import MemoryStore, FakeTelegram, FakeModel, payload
 
 
 class SearchTests(unittest.TestCase):
+    def tool_response(self, name, arguments, call_id='call_search'):
+        return httpx.Response(200, json={'id': 'synthetic', 'object': 'chat.completion',
+            'model': 'glm-4.7', 'created': 1, 'choices': [{'index': 0, 'finish_reason': 'tool_calls',
+            'message': {'role': 'assistant', 'content': None, 'tool_calls': [
+                {'id': call_id, 'type': 'function', 'function': {'name': name, 'arguments': arguments}}]}}],
+            'usage': {'prompt_tokens': 100, 'completion_tokens': 10, 'total_tokens': 110}})
+
+    def test_explicit_search_roundtrip_after_skill_returns_real_evidence_and_charges(self):
+        requests = []
+        def handler(request):
+            body = json.loads(request.content)
+            requests.append((request.url.path, body))
+            if request.url.path.endswith('/web_search'):
+                self.assertEqual(body, {'search_engine': 'search-prime', 'search_query': 'кафе Щёлковская', 'count': 5})
+                return httpx.Response(200, json={'search_result': [
+                    {'title': 'Cafe', 'link': 'https://example.com/cafe', 'content': 'Evidence from public page'},
+                    {'title': 'Unsafe', 'link': 'http://127.0.0.1/private', 'content': 'private'},
+                    {'title': 'Duplicate', 'link': 'https://example.com/cafe', 'content': 'duplicate'}]})
+            if len(requests) == 1:
+                return self.tool_response('load_skill', '{"name":"nearby-places"}', 'call_skill')
+            if len(requests) == 2:
+                self.assertIn('search_web', json.dumps(body['tools']))
+                return self.tool_response('search_web', '{"query":"кафе Щёлковская"}')
+            tool_results = [message for message in body['messages'] if message['role'] == 'tool']
+            self.assertEqual([message['tool_call_id'] for message in tool_results], ['call_skill', 'call_search'])
+            evidence = json.loads(tool_results[-1]['content'])
+            self.assertEqual(evidence['result_count'], 1)
+            self.assertEqual(evidence['results'][0]['content'], 'Evidence from public page')
+            self.assertNotIn('private', tool_results[-1]['content'])
+            return self.response(text='Found Cafe')
+        model = self.model(handler)
+        with patch('model.event') as log:
+            answer = model.generate('Find nearby cafes', [{'role': 'user', 'content': 'кафе Щёлковская'}], allow_search=True)
+        self.assertIn('https://example.com/cafe', answer)
+        self.assertEqual(len(requests), 4)
+        self.assertEqual(model.store.total, Decimal('0.040291'))
+        events = [call for call in log.call_args_list if call.args[0].startswith('web_search_')]
+        self.assertEqual([call.args[0] for call in events], ['web_search_started', 'web_search_completed'])
+        self.assertEqual(events[-1].kwargs['result_count'], 1)
+        self.assertNotIn('Щёлковская', str(log.call_args_list))
+        self.assertNotIn('Evidence from public page', str(log.call_args_list))
+
+    def test_required_search_refusal_is_retried_then_rejected(self):
+        requests = []
+        def handler(request):
+            requests.append(json.loads(request.content))
+            return self.response(text='Run /search yourself')
+        with patch('model.event') as log:
+            with self.assertRaises(ModelFailure):
+                self.model(handler).generate('Lookup', [], allow_search=True, require_search=True)
+        self.assertEqual(len(requests), 4)
+        self.assertIn('Call search_web', requests[-1]['messages'][0]['content'])
+        self.assertTrue(any(call.kwargs.get('reason') == 'search_not_executed' for call in log.call_args_list))
+
+    def test_explicit_search_budget_rejection_does_not_call_search_endpoint(self):
+        store = Allowance()
+        reservations = []
+        def reserve(amount, budget):
+            reservations.append(amount)
+            if len(reservations) == 2:
+                raise BudgetExceeded()
+        store.reserve = reserve
+        requests = []
+        def handler(request):
+            requests.append(request.url.path)
+            return self.tool_response('search_web', '{"query":"public query"}')
+        with self.assertRaises(BudgetExceeded):
+            self.model(handler, store).generate('Lookup', [], allow_search=True)
+        self.assertEqual(len(requests), 1)
+        self.assertFalse(any(path.endswith('/web_search') for path in requests))
+
+    def test_empty_search_results_are_returned_as_empty_evidence(self):
+        requests = []
+        def handler(request):
+            requests.append(request.url.path)
+            if request.url.path.endswith('/web_search'):
+                return httpx.Response(200, json={'search_result': []})
+            if len(requests) == 1:
+                return self.tool_response('search_web', '{"query":"public query"}')
+            body = json.loads(request.content)
+            self.assertEqual(json.loads(body['messages'][-1]['content'])['result_count'], 0)
+            return self.response(text='No usable results')
+        self.assertEqual(self.model(handler).generate('Lookup', [], allow_search=True, require_search=True), 'No usable results')
+        self.assertEqual(len(requests), 3)
+
+    def test_invalid_search_arguments_never_call_search_endpoint(self):
+        for arguments in ('{"query":""}', '{"query":"public","query":"secret"}',
+                          '{"query":"public","url":"http://127.0.0.1"}', '{"query":42}'):
+            with self.subTest(arguments=arguments):
+                requests = []
+                def handler(request):
+                    requests.append(request.url.path)
+                    return self.tool_response('search_web', arguments)
+                with self.assertRaises(ModelFailure):
+                    self.model(handler).generate('Lookup', [], allow_search=True)
+                self.assertEqual(len(requests), 1)
+
+    def test_search_failure_hides_response_body_and_stops(self):
+        def handler(request):
+            if request.url.path.endswith('/web_search'):
+                return httpx.Response(401, json={'error': {'message': 'synthetic-secret'}})
+            return self.tool_response('search_web', '{"query":"public query"}')
+        with patch('model.event') as log:
+            with self.assertRaises(ModelFailure) as error:
+                self.model(handler).generate('Lookup', [], allow_search=True)
+        self.assertNotIn('synthetic-secret', str(error.exception))
+        self.assertNotIn('synthetic-secret', str(log.call_args_list))
+        failed = [call for call in log.call_args_list if call.args[0] == 'web_search_failed']
+        self.assertEqual(failed[0].kwargs['status_code'], 401)
+
+    def test_searches_across_rounds_have_no_two_call_limit(self):
+        model = self.model(lambda _: self.fail('Mocked generation and search only'))
+        from providers import Generation, ToolCall
+        responses = [Generation('', True, tool_calls=(
+            ToolCall(f'call{i}', 'search_web', '{"query":"public query"}'),)) for i in range(4)]
+        responses.append(Generation('Done', True))
+        with patch.object(model, '_generation_attempt', side_effect=responses), \
+                patch.object(model.provider, 'search', return_value=[]) as search:
+            self.assertEqual(model.generate('Lookup', [], allow_search=True), 'Done')
+        self.assertEqual(search.call_count, 4)
+
+    def test_last_model_round_drains_batch_then_requests_tools_disabled_final_answer(self):
+        # The final batch has 8 calls: 4 run, 4 get a short too_many_calls result.
+        model = self.model(lambda _: self.fail('Mocked generation and search only'))
+        from providers import Generation, ToolCall
+        responses = [Generation('', True, tool_calls=(
+            ToolCall(f'call{i}', 'search_web', '{"query":"public query"}'),)) for i in range(4)]
+        responses.append(Generation('', True, tool_calls=tuple(
+            ToolCall(f'last{i}', 'search_web', '{"query":"public query"}') for i in range(8))))
+        responses.append(Generation('Done', True))
+        with patch.object(model, '_generation_attempt', side_effect=responses) as generate, \
+                patch.object(model.provider, 'search', return_value=[]) as search:
+            self.assertEqual(model.generate('Lookup', [], allow_search=True), 'Done')
+        self.assertEqual(generate.call_count, 6)
+        self.assertEqual(search.call_count, 8)
+        rejected = [item for item in generate.call_args.kwargs['continuation'] if 'too_many_calls' in str(item)]
+        self.assertEqual(len(rejected), 4)
+        final = generate.call_args
+        self.assertFalse(final.args[4])
+        self.assertFalse(final.args[6])
+        self.assertFalse(final.kwargs['skill_enabled'])
+        self.assertEqual(len(final.kwargs['continuation']), 12)
+
+    def test_final_answer_keeps_json_mode_and_repairs_without_research(self):
+        generations = []
+        searches = []
+        def handler(request):
+            body = json.loads(request.content)
+            if request.url.path.endswith('/web_search'):
+                searches.append(body)
+                return httpx.Response(200, json={'search_result': [
+                    {'title': 'Cafe', 'link': 'https://example.com/cafe', 'content': 'Public evidence'}]})
+            generations.append(body)
+            self.assertEqual(body['response_format'], {'type': 'json_object'})
+            if len(generations) <= 5:
+                return self.tool_response('search_web', '{"query":"public cafes"}', f'call{len(generations)}')
+            self.assertNotIn('tools', body)
+            if len(generations) == 6:
+                tools = [m for m in body['messages'] if m['role'] == 'tool']
+                self.assertEqual([m['tool_call_id'] for m in tools], [f'call{i}' for i in range(1, 6)])
+                self.assertTrue(all('Public evidence' in m['content'] for m in tools))
+                return self.response(text='Invalid plain answer')
+            self.assertEqual(len(generations), 7)
+            self.assertTrue(any(m['role'] == 'assistant' and m['content'] == 'Invalid plain answer'
+                                for m in body['messages']))
+            self.assertTrue(any('JSON validation feedback' in str(m['content']) for m in body['messages']))
+            return self.response(text='{"respond":true,"reply":"Cafe found"}')
+        with patch('model.event') as log:
+            decision = self.model(handler).decide_reply('Lookup', [], allow_search=True)
+        self.assertIn('Cafe found', decision)
+        self.assertIn('https://example.com/cafe', decision)
+        self.assertEqual(len(searches), 5)
+        names = [call.args[0] for call in log.call_args_list]
+        self.assertIn('ai_final_answer_started', names)
+        self.assertIn('ai_final_answer_completed', names)
+        self.assertIn('ai_json_repair_completed', names)
+
+    def test_final_answer_budget_failure_stops_without_research_retry(self):
+        model = self.model(lambda _: self.fail('Mocked generation and search only'))
+        from providers import Generation, ToolCall
+        responses = [Generation('', True, tool_calls=(
+            ToolCall(f'call{i}', 'search_web', '{"query":"public query"}'),)) for i in range(5)]
+        responses.append(BudgetExceeded())
+        with patch.object(model, '_generation_attempt', side_effect=responses) as generate, \
+                patch.object(model.provider, 'search', return_value=[]) as search, patch('model.event') as log:
+            with self.assertRaises(BudgetExceeded):
+                model.generate('Lookup', [], allow_search=True)
+        self.assertEqual(generate.call_count, 6)
+        self.assertEqual(search.call_count, 5)
+        self.assertEqual(log.call_args.args[0], 'ai_final_answer_failed')
+
+    def test_eight_search_calls_answer_every_id_but_run_only_four(self):
+        requests = []
+        def handler(request):
+            body = json.loads(request.content)
+            requests.append((request.url.path, body))
+            if request.url.path.endswith('/web_search'):
+                return httpx.Response(200, json={'search_result': [
+                    {'title': 'Cafe', 'link': 'https://example.com/cafe', 'content': 'Public evidence'}]})
+            if len(requests) == 1:
+                return self.tool_response('load_skill', '{"name":"nearby-places"}', 'call_skill')
+            if len(requests) == 2:
+                document = self.tool_response('search_web', '{"query":"cafes"}', 'search1').json()
+                for i in range(2, 9):
+                    document['choices'][0]['message']['tool_calls'].append({'id': f'search{i}', 'type': 'function',
+                        'function': {'name': 'search_web', 'arguments': '{"query":"exhibitions"}'}})
+                return httpx.Response(200, json=document)
+            tools = [message for message in body['messages'] if message['role'] == 'tool']
+            self.assertEqual([message['tool_call_id'] for message in tools], ['call_skill'] + [f'search{i}' for i in range(1, 9)])
+            assistants = [message for message in body['messages'] if message['role'] == 'assistant']
+            self.assertEqual(len(assistants), 2)
+            self.assertEqual(len(assistants[-1]['tool_calls']), 8)
+            return self.response(text='Found Cafe')
+        with patch('model.event') as log:
+            answer = self.model(handler).generate('Lookup', [], allow_search=True)
+        self.assertIn('https://example.com/cafe', answer)
+        # Skill, batch, four searches, answer: calls 5-8 are rejected without searching.
+        self.assertEqual(len(requests), 7)
+        self.assertEqual(len([path for path, _ in requests if path.endswith('/web_search')]), 4)
+        batches = [call for call in log.call_args_list if call.args[0] == 'tool_batch_received']
+        self.assertEqual(batches[0].kwargs['tool_call_count'], 8)
+
+    def test_batch_load_and_search_preserves_both_tool_results(self):
+        requests = []
+        def handler(request):
+            body = json.loads(request.content)
+            requests.append(request.url.path)
+            if request.url.path.endswith('/web_search'):
+                return httpx.Response(200, json={'search_result': []})
+            if len(requests) == 1:
+                document = self.tool_response('load_skill', '{"name":"nearby-places"}', 'skill').json()
+                document['choices'][0]['message']['tool_calls'].append({'id': 'search', 'type': 'function',
+                    'function': {'name': 'search_web', 'arguments': '{"query":"public cafes"}'}})
+                return httpx.Response(200, json=document)
+            tools = [message for message in body['messages'] if message['role'] == 'tool']
+            self.assertEqual([message['tool_call_id'] for message in tools], ['skill', 'search'])
+            return self.response(text='No results')
+        self.assertEqual(self.model(handler).generate('Lookup', [], allow_search=True), 'No results')
+        self.assertEqual(len(requests), 3)
+
+    def test_batch_is_fully_validated_before_any_search_or_skill_read(self):
+        from providers import Generation, ToolCall
+        cases = [((ToolCall('id1', 'search_web', '{"query":"public"}'),
+                   ToolCall('id2', 'run_shell', '{}')), 'unknown_tool'),
+                 ((ToolCall('id', 'load_skill', '{"name":"nearby-places"}'),
+                   ToolCall('id', 'search_web', '{"query":"public"}')), 'duplicate_call_id'),
+                 ((ToolCall('id1', 'load_skill', '{"name":"nearby-places"}'),
+                   ToolCall('id2', 'search_web', '{"query":42}')), 'invalid_arguments')]
+        for calls, error in cases:
+            with self.subTest(error=error):
+                model = self.model(lambda _: self.fail('No HTTP allowed'))
+                with patch.object(model, '_generation_attempt', return_value=Generation('', True, tool_calls=calls)), \
+                        patch.object(model.provider, 'search') as search, patch('model.place_instructions') as load, \
+                        patch('model.event') as log:
+                    with self.assertRaises(ModelFailure):
+                        model.generate('Lookup', [], allow_search=True)
+                    search.assert_not_called()
+                    load.assert_not_called()
+                failures = [call for call in log.call_args_list if call.args[0] == 'skill_failed']
+                self.assertEqual(failures[-1].kwargs['tool_error'], error)
+
     def model(self, handler, store=None):
         http = httpx.Client(transport=httpx.MockTransport(handler), trust_env=False)
         self.addCleanup(http.close)
@@ -77,9 +338,12 @@ class SearchTests(unittest.TestCase):
 
     def test_search_works_with_json_decisions_and_safe_sources(self):
         def handler(request):
+            from nearby_places import instructions as place_instructions
             body = json.loads(request.content)
             self.assertEqual(body['response_format'], {'type': 'json_object'})
             self.assertEqual(body['tools'][0]['type'], 'web_search')
+            self.assertNotIn(place_instructions(), body['messages'][0]['content'])
+            self.assertEqual(body['tools'][1]['function']['name'], 'load_skill')
             return self.response([{'title': 'Fact', 'link': 'https://example.com/fact'}],
                                  '{"respond":true,"reply":"Fact"}')
         self.assertIn('https://example.com/fact', self.model(handler).decide_reply('Cat', [], allow_search=True))

@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 import os
 import math
+import re
 from policy import valid_limit
 from providers import PRICES, DEFAULT_MODELS, VISION_PRICES
 
@@ -32,6 +33,10 @@ class Config:
     user_media_per_minute: int = 3
     chat_budget: Decimal = Decimal('0')
     worker_count: int = 2
+    # Tool results (skill body, searches, reviews) have their own budget so a
+    # normally full history does not make research requests fail.
+    max_tool_chars: int = 40000
+    tools_url: str = ''
 
     @classmethod
     def load(cls):
@@ -52,6 +57,9 @@ class Config:
             user_media_per_minute=int(os.getenv('USER_MEDIA_PER_MINUTE', '3')),
             chat_budget=Decimal(os.getenv('CHAT_BUDGET_USD', '0')),
             worker_count=int(os.getenv('WORKER_COUNT', '2')),
+            max_input_chars=int(os.getenv('MAX_INPUT_CHARS', '30000')),
+            max_tool_chars=int(os.getenv('MAX_TOOL_CHARS', '40000')),
+            tools_url=os.getenv('TOOLS_URL', ''),
             provider=provider, zai_key=zai_key,
             api_min_interval_seconds=float(os.getenv('API_MIN_INTERVAL_SECONDS', '0.25')),
             zai_vision_model=os.getenv('ZAI_VISION_MODEL', 'glm-4.6v') if provider == 'zai' else 'glm-4.6v',
@@ -71,6 +79,10 @@ class Config:
             raise ValueError('Request limits must be between 1 and 1000')
         if not config.chat_budget.is_finite() or config.chat_budget < 0:
             raise ValueError('Invalid per-chat budget')
+        if not 10000 <= config.max_input_chars <= 500000 or not 5000 <= config.max_tool_chars <= 500000:
+            raise ValueError('Invalid input or tool context limit')
+        if config.tools_url and not re.fullmatch(r'http://[a-z0-9.-]+(?::[0-9]{1,5})?', config.tools_url):
+            raise ValueError('TOOLS_URL must be an internal http://host[:port] address')
         if not 1 <= config.worker_count <= 8:
             raise ValueError('Worker count must be between 1 and 8')
         if not 1024 <= config.media_max_bytes <= 10 * 1024 * 1024 or not 1 <= config.voice_max_seconds <= 300:

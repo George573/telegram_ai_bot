@@ -17,8 +17,9 @@ from model import Model, ModelFailure, WEB_CALL_COST, citation_sources
 from policy import normalize
 from service import Service
 from storage import BudgetExceeded
-from test_service import MemoryStore, FakeModel, FakeTelegram
+from test_service import MemoryStore, FakeModel, FakeTelegram, payload
 from test_clients import Allowance
+from nearby_places import instructions as place_instructions
 
 
 def update(kind='photo', text='', reply=False, **extra):
@@ -129,7 +130,32 @@ class SearchAndMediaModelTests(unittest.TestCase):
     def model(self, create, allowance=None):
         return Model(Config('fake', 'fake', frozenset({-1})), allowance or Allowance(),
                      SimpleNamespace(responses=SimpleNamespace(create=create)))
-    def test_search_is_the_only_tool_is_capped_and_charged_with_links(self):
+    def test_natural_lookup_uses_search_and_remembers_sources_for_followup(self):
+        requests = []
+        def create(**kwargs):
+            requests.append(kwargs)
+            return SimpleNamespace(status='completed', output_text='Exhibition near the metro',
+                usage=SimpleNamespace(input_tokens=100, output_tokens=10), output=[
+                {'type': 'web_search_call'}, {'type': 'message', 'content': [{'annotations': [
+                    {'type': 'url_citation', 'url': 'https://example.com/exhibition', 'title': 'Exhibition'}]}]}])
+        model = self.model(create)
+        store, telegram = MemoryStore(), FakeTelegram()
+        store.chat['web_enabled'] = True
+        service = Service(model.config, store, telegram, model)
+        service.accept(1, payload('/chat find current exhibitions near the metro'))
+        for _ in range(3): service.process_one()
+        self.assertEqual(requests[0]['tool_choice'], 'auto')
+        self.assertNotIn(place_instructions(), requests[0]['instructions'])
+        self.assertEqual(requests[0]['tools'][1]['name'], 'load_skill')
+        self.assertIn('Current UTC date:', requests[0]['instructions'])
+        self.assertIn('https://example.com/exhibition', telegram.sent[-1])
+        service.accept(2, payload('/chat which is closest?'))
+        service.process_one()
+        service.process_one()
+        previous_answer = requests[-1]['input'][-2]
+        self.assertEqual(previous_answer['role'], 'assistant')
+        self.assertIn('https://example.com/exhibition', previous_answer['content'])
+    def test_search_and_local_skill_tools_are_capped_and_charged_with_links(self):
         params = []
         def create(**kwargs):
             params.append(kwargs)
@@ -139,15 +165,28 @@ class SearchAndMediaModelTests(unittest.TestCase):
                     {'type': 'url_citation', 'url': 'https://example.com/fact', 'title': 'Source'}]}]}])
         allowance = Allowance()
         answer = self.model(create, allowance).generate('Cat', [{'role': 'user', 'content': 'Latest news?'}], allow_search=True)
-        self.assertEqual(params[0]['tools'], [{'type': 'web_search', 'search_context_size': 'low'}])
+        self.assertEqual(params[0]['tools'][0], {'type': 'web_search', 'search_context_size': 'low'})
+        self.assertEqual(params[0]['tools'][1]['name'], 'load_skill')
+        self.assertEqual(params[0]['tools'][2]['name'], 'read_yandex_reviews')
+        self.assertEqual(len(params[0]['tools']), 3)
         self.assertEqual(params[0]['max_tool_calls'], 1)
+        self.assertEqual(params[0]['tool_choice'], 'auto')
         self.assertIn('https://example.com/fact', answer)
         self.assertGreater(allowance.total, WEB_CALL_COST)
     def test_search_disabled_no_tool_fee_and_silent_decisions_not_sent(self):
         def create(**kwargs):
             self.assertNotIn('tools', kwargs)
+            self.assertNotIn(place_instructions(), kwargs['instructions'])
             return SimpleNamespace(status='completed', output_text='{"respond":false,"reply":""}', usage=None)
         self.assertIsNone(self.model(create).decide_reply('Cat', [], allow_search=False))
+    def test_missing_skill_fails_before_request_and_reservation(self):
+        allowance = Allowance()
+        model = self.model(lambda **_: self.fail('No request without bundled instructions'), allowance)
+        with patch('model.place_catalog', side_effect=FileNotFoundError('synthetic-private-path')):
+            with self.assertRaises(ModelFailure) as caught:
+                model.generate('Find a cafe', [], allow_search=True)
+        self.assertEqual(allowance.total, 0)
+        self.assertNotIn('synthetic-private-path', str(caught.exception))
     def test_web_failure_has_no_unverified_fallback_and_keeps_reservation(self):
         allowance = Allowance()
         def create(**_): raise RuntimeError('fake-secret')

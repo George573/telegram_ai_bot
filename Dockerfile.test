@@ -1,2 +1,3 @@
 FROM telegram-roleplay:dev
 COPY tests /app/tests
+COPY tools /app/tools
