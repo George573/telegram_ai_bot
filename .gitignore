@@ -7,3 +7,6 @@ __pycache__/
 .venv/
 backups/
 work/
+
+# Untracked third-party reference snapshots (includes their own CLAUDE.md); not part of the bot.
+reference-originals/

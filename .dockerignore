@@ -1,14 +1,25 @@
 # Only application/build inputs enter the daemon's build context.
+# Re-include individual file globs, never whole directories.
 **
 !Dockerfile
 !Dockerfile.db
 !Dockerfile.test
 !requirements.lock
-!src/
 !src/*.py
-!scripts/
+!src/licenses/*.txt
+!src/skills/*/SKILL.md
 !scripts/*.sh
 !scripts/*.sql
 !scripts/discover_chat.py
-!tests/
-!tests/test_*.py
+!tests/*.py
+!tests/browser/*.py
+!tools/Dockerfile
+!tools/requirements.lock
+!tools/*.py
+# Secrets and caches stay out even inside allowed folders.
+**/.env
+**/.env.*
+**/credentials
+**/credentials.*
+**/__pycache__
+**/*.pyc
