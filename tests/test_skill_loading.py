@@ -11,7 +11,8 @@ from openai import OpenAI
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 from config import Config
 from model import Model, ModelFailure
-from nearby_places import instructions as skill_body
+from skill_registry import instructions as _load_skill_body
+def skill_body(name='nearby-places'): return _load_skill_body(name)
 from storage import BudgetExceeded
 from test_clients import Allowance
 
@@ -33,6 +34,17 @@ class TrackedAllowance(Allowance):
         super().reconcile(reserved, actual)
 
 
+EVIDENCE = [{'title': 'Cafe', 'url': 'https://example.com/cafe', 'content': 'Evidence', 'publish_date': ''}]
+SEARCH_CALL = ('search_web', '{"query":"public cafe","site":null,"recency":null}')
+
+
+def cards(name='Cafe', link='https://example.com/cafe'):
+    """A valid place_recommendations answer."""
+    return json.dumps({'intro': 'Here you go', 'follow_up': None, 'evidence_gaps': None, 'items': [
+        {'kind': 'cafe', 'name': name, 'venue': None, 'address': None, 'when': None, 'price': None,
+         'why': 'Matches the request', 'reviews': None, 'caveats': None, 'links': [link]}]})
+
+
 class SkillLoadingTests(unittest.TestCase):
     def model(self, provider, handler, allowance=None):
         http = httpx.Client(transport=httpx.MockTransport(handler), trust_env=False)
@@ -42,21 +54,20 @@ class SkillLoadingTests(unittest.TestCase):
         config = Config('synthetic', 'synthetic', frozenset({-1}), provider=provider,
                         model='gpt-6-luna' if provider == 'openai' else 'glm-4.7',
                         zai_key='synthetic', api_min_interval_seconds=0)
-        return Model(config, allowance or TrackedAllowance(), client)
+        model = Model(config, allowance or TrackedAllowance(), client)
+        # Search itself is covered in test_search_typing; here it only supplies evidence.
+        model._search_web = lambda query, site=None, recency=None: (EVIDENCE, True)
+        return model
 
     def response(self, provider, *, call=None, text='Hello', searched=False):
+        """searched=True with a call also requests search_web in the same batch."""
+        calls = ([call] if call is not None else []) + ([SEARCH_CALL] if searched and call is not None else [])
         if provider == 'openai':
             output = []
-            if searched:
-                output.extend([{'type': 'web_search_call', 'id': 'ws_fake', 'status': 'completed',
-                    'action': {'type': 'search', 'query': 'public cafe'}},
-                    {'type': 'message', 'id': 'msg_source', 'role': 'assistant', 'status': 'completed',
-                     'content': [{'type': 'output_text', 'text': 'Evidence', 'annotations': [
-                        {'type': 'url_citation', 'url': 'https://example.com/cafe', 'title': 'Cafe',
-                         'start_index': 0, 'end_index': 8}]}]}])
-            if call is not None:
-                output.append({'type': 'function_call', 'id': 'fc_fake', 'call_id': 'call_fake',
-                    'name': call[0], 'arguments': call[1], 'status': 'completed'})
+            if calls:
+                for index, (name, arguments) in enumerate(calls):
+                    output.append({'type': 'function_call', 'id': f'fc_fake{index}', 'call_id': f'call_fake{index}',
+                        'name': name, 'arguments': arguments, 'status': 'completed'})
             else:
                 output.append({'type': 'message', 'id': 'msg_fake', 'role': 'assistant',
                     'status': 'completed', 'content': [{'type': 'output_text', 'text': text, 'annotations': []}]})
@@ -65,13 +76,13 @@ class SkillLoadingTests(unittest.TestCase):
                 'usage': {'input_tokens': 100, 'output_tokens': 10, 'total_tokens': 110}})
         message = {'role': 'assistant', 'content': None if call is not None else text}
         if call is not None:
-            message.update(tool_calls=[{'id': 'call_fake', 'type': 'function',
-                'function': {'name': call[0], 'arguments': call[1]}}], reasoning_content='Synthetic reasoning')
+            message.update(tool_calls=[{'id': f'call_fake{index}', 'type': 'function',
+                'function': {'name': name, 'arguments': arguments}} for index, (name, arguments) in enumerate(calls)],
+                reasoning_content='Synthetic reasoning')
         return httpx.Response(200, json={'id': 'chat_fake', 'object': 'chat.completion', 'created': 1,
             'model': 'glm-4.7', 'choices': [{'index': 0, 'finish_reason': 'tool_calls' if call else 'stop',
                                          'message': message}],
-            'usage': {'prompt_tokens': 100, 'completion_tokens': 10, 'total_tokens': 110},
-            'web_search': [{'title': 'Cafe', 'link': 'https://example.com/cafe'}] if searched else []})
+            'usage': {'prompt_tokens': 100, 'completion_tokens': 10, 'total_tokens': 110}})
 
     def test_unrelated_reply_never_reads_or_sends_skill_body(self):
         for provider in ('openai', 'zai'):
@@ -81,7 +92,7 @@ class SkillLoadingTests(unittest.TestCase):
                     bodies.append(json.loads(request.content))
                     return self.response(provider)
                 model = self.model(provider, handler)
-                with patch('model.place_instructions') as load:
+                with patch('model.skill_instructions') as load:
                     self.assertEqual(model.generate('Cat', [{'role': 'user', 'content': 'Hi'}], allow_search=True), 'Hello')
                 load.assert_not_called()
                 self.assertEqual(len(bodies), 1)
@@ -95,9 +106,9 @@ class SkillLoadingTests(unittest.TestCase):
                 def handler(request):
                     bodies.append(json.loads(request.content))
                     if len(bodies) == 1:
-                        return self.response(provider, call=('load_skill', '{"name":"nearby-places"}'))
+                        return self.response(provider, call=('load_skill', '{"name":"nearby-places"}'), searched=True)
                     if len(bodies) == 2:
-                        return self.response(provider, text='Malformed conversational answer', searched=True)
+                        return self.response(provider, text='Malformed conversational answer')
                     return self.response(provider, text='{"respond":true,"reply":"Cafe"}')
                 answer = self.model(provider, handler).decide_reply('Cat', [], allow_search=True)
                 self.assertIn('Cafe', answer)
@@ -112,12 +123,12 @@ class SkillLoadingTests(unittest.TestCase):
                 bodies = []
                 def handler(request):
                     bodies.append(json.loads(request.content))
-                    return self.response(provider, call=('load_skill', '{"name":"nearby-places"}')) if len(bodies) == 1 else self.response(provider, text='{"respond":true,"reply":"Cafe"}', searched=provider == 'zai')
+                    return self.response(provider, call=('load_skill', '{"name":"nearby-places"}'), searched=True) if len(bodies) == 1 else self.response(provider, text='{"respond":true,"reply":"Cafe"}')
                 model = self.model(provider, handler)
                 history = [{'role': 'user', 'content': 'Find a nearby cafe'}]
-                with patch('model.place_instructions', wraps=skill_body) as load:
+                with patch('model.skill_instructions', wraps=skill_body) as load:
                     self.assertIn('Cafe', model.decide_reply('Cat', history, allow_search=True))
-                load.assert_called_once_with()
+                load.assert_called_once_with('nearby-places')
                 self.assertEqual(len(bodies), 2)
                 self.assertEqual(len(model.store.reservations), 2)
                 self.assertEqual(len(model.store.charges), 2)
@@ -125,19 +136,20 @@ class SkillLoadingTests(unittest.TestCase):
                 self.assertEqual(history, [{'role': 'user', 'content': 'Find a nearby cafe'}])
                 if provider == 'openai':
                     self.assertNotIn(skill_body(), bodies[0]['instructions'])
-                    result = bodies[1]['input'][-1]
+                    result = bodies[1]['input'][-2]
                     self.assertEqual(result['type'], 'function_call_output')
                     self.assertEqual(result['output'], skill_body())
                     self.assertEqual(bodies[0]['text'], bodies[1]['text'])
                     self.assertFalse(bodies[1]['store'])
                 else:
                     self.assertNotIn(skill_body(), bodies[0]['messages'][0]['content'])
-                    result = bodies[1]['messages'][-1]
+                    result = bodies[1]['messages'][-2]
                     self.assertEqual(result['role'], 'tool')
                     self.assertEqual(result['content'], skill_body())
-                    self.assertEqual(bodies[1]['messages'][-2]['reasoning_content'], 'Synthetic reasoning')
+                    self.assertEqual(bodies[1]['messages'][-3]['reasoning_content'], 'Synthetic reasoning')
                     self.assertEqual(bodies[0]['response_format'], bodies[1]['response_format'])
-                self.assertNotIn('load_skill', json.dumps(bodies[1]['tools']))
+                # load_skill stays offered for the other skill; this one is never re-read (load called once).
+                self.assertIn('load_skill', json.dumps(bodies[1]['tools']))
 
     def test_invalid_calls_never_read_files_or_continue(self):
         calls = [('run_shell', '{}'), ('load_skill', '{"name":"../../.env"}'),
@@ -152,7 +164,7 @@ class SkillLoadingTests(unittest.TestCase):
                         requests.append(request)
                         return self.response(provider, call=call)
                     model = self.model(provider, handler)
-                    with patch('model.place_instructions') as load:
+                    with patch('model.skill_instructions') as load:
                         with self.assertRaises(ModelFailure): model.generate('Cat', [], allow_search=True)
                     load.assert_not_called()
                     self.assertEqual(len(requests), 1)
@@ -169,7 +181,7 @@ class SkillLoadingTests(unittest.TestCase):
                     allowance = TrackedAllowance(reject_second=limited == 'budget')
                     model = self.model(provider, handler, allowance)
                     if limited == 'context': model.config = replace(model.config, max_tool_chars=4500)
-                    with patch('model.place_instructions', side_effect=OSError('synthetic-secret') if limited == 'missing' else None,
+                    with patch('model.skill_instructions', side_effect=OSError('synthetic-secret') if limited == 'missing' else None,
                                wraps=skill_body if limited != 'missing' else None):
                         with self.assertRaises(BudgetExceeded if limited == 'budget' else ModelFailure) as caught:
                             model.generate('Cat', [], allow_search=True)
@@ -190,10 +202,10 @@ class SkillLoadingTests(unittest.TestCase):
                     requests.append(json.loads(request.content))
                     if len(requests) == 1:
                         return self.response(provider, call=('load_skill', '{"name":"nearby-places"}'), searched=True)
-                    return self.response(provider, text='Answer from gathered evidence')
+                    return self.response(provider, text=cards('Answer from gathered evidence'))
                 model = self.model(provider, handler)
                 model.config = replace(model.config, max_tool_chars=4500)
-                with patch('model.place_instructions', wraps=skill_body):
+                with patch('model.skill_instructions', wraps=skill_body):
                     self.assertIn('Answer from gathered evidence', model.generate('Cat', [], allow_search=True))
                 self.assertEqual(len(requests), 2)
                 self.assertNotIn('tools', requests[1])
@@ -207,11 +219,11 @@ class SkillLoadingTests(unittest.TestCase):
                     requests.append(request)
                     if len(requests) == 1:
                         return self.response(provider, call=('load_skill', '{"name":"nearby-places"}'), searched=True)
-                    return self.response(provider, text='Cafe')
+                    return self.response(provider, text=cards())
                 model = self.model(provider, handler)
                 # History near the conversation limit plus the full skill body still fits.
                 history = [{'role': 'user', 'content': 'x' * 15000}]
-                with patch('model.place_instructions', wraps=skill_body):
+                with patch('model.skill_instructions', wraps=skill_body):
                     self.assertIn('Cafe', model.generate('Cat', history, allow_search=True))
                 self.assertEqual(len(requests), 2)
 
@@ -221,13 +233,13 @@ class SkillLoadingTests(unittest.TestCase):
                 bodies = []
                 def handler(request):
                     bodies.append(json.loads(request.content))
-                    return self.response(provider, call=('load_skill', '{"name":"nearby-places"}'), searched=True) if len(bodies) == 1 else self.response(provider, text='Cafe')
+                    return self.response(provider, call=('load_skill', '{"name":"nearby-places"}'), searched=True) if len(bodies) == 1 else self.response(provider, text=cards())
                 answer = self.model(provider, handler).generate('Cat', [], allow_search=True, require_search=True)
                 self.assertIn('https://example.com/cafe', answer)
-                if provider == 'openai':
-                    self.assertEqual([tool.get('name') for tool in bodies[1]['tools']], ['read_yandex_reviews'])
-                else:
-                    self.assertIn('search_web', json.dumps(bodies[1]['tools']))
+                # Both providers keep the same local tools after a search; no hosted search exists.
+                names = [tool.get('name') or tool['function']['name'] for tool in bodies[1]['tools']]
+                self.assertIn('search_web', names)
+                self.assertNotIn('web_search', json.dumps([tool.get('type') for tool in bodies[1]['tools']]))
 
     def test_repeated_skill_calls_reuse_body_until_model_round_limit(self):
         for provider in ('openai', 'zai'):
@@ -239,12 +251,12 @@ class SkillLoadingTests(unittest.TestCase):
                         return self.response(provider, call=('load_skill', '{"name":"nearby-places"}'), searched=True)
                     body = json.loads(request.content)
                     self.assertNotIn('tools', body)
-                    return self.response(provider, text='Final answer')
+                    return self.response(provider, text=cards('Final answer'))
                 model = self.model(provider, handler)
                 model.config = replace(model.config, max_input_chars=100000)
-                with patch('model.place_instructions', wraps=skill_body) as load:
+                with patch('model.skill_instructions', wraps=skill_body) as load:
                     answer = model.generate('Cat', [], allow_search=True)
                     self.assertIn('Final answer', answer)
-                load.assert_called_once_with()
+                load.assert_called_once_with('nearby-places')
                 self.assertEqual(len(requests), 6)
                 self.assertEqual(len(model.store.charges), 6)

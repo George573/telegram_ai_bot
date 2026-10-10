@@ -7,7 +7,7 @@ import sys
 from datetime import datetime, timezone
 from decimal import Decimal
 from providers import PRICES, VISION_PRICES, ZAI_ERROR_CODES
-from nearby_places import SKILL_NAME
+from skill_registry import SKILL_NAMES
 
 LOGGER = logging.getLogger('telegram_bot')
 LOGGER.addHandler(logging.NullHandler())
@@ -25,12 +25,13 @@ EVENTS = frozenset({
     'ai_final_answer_started', 'ai_final_answer_completed', 'ai_final_answer_failed',
     'reviews_read_started', 'reviews_read_completed', 'reviews_read_failed',
     'worker_failed', 'job_failed', 'update_failed', 'budget_overrun', 'command_throttled',
+    'afisha_read_started', 'afisha_read_completed', 'afisha_read_failed', 'recommendations_rendered',
 })
 NUMBERS = frozenset({'duration_ms', 'input_tokens', 'output_tokens', 'search_calls',
                      'update_id', 'status_code', 'retry_after', 'attempt', 'delay_ms', 'error_position',
                      'error_line', 'error_column', 'output_chars', 'repair_attempt', 'max_repairs', 'query_chars', 'result_count',
                      'tool_call_count', 'argument_chars', 'returned_chars', 'model_rounds', 'review_count',
-                     'failure_count'})
+                     'failure_count', 'dropped_links'})
 AMOUNTS = frozenset({'reserved_usd', 'charged_usd', 'budget_usd'})
 MODELS = frozenset(model for models in PRICES.values() for model in models) | frozenset(VISION_PRICES) | {'glm-asr-2512', 'gpt-transcribe'}
 ENUMS = {'parser_error': frozenset({'expected_value', 'extra_data', 'expected_key',
@@ -38,11 +39,14 @@ ENUMS = {'parser_error': frozenset({'expected_value', 'extra_data', 'expected_ke
          'format_hint': frozenset({'object', 'array', 'json_fence', 'fence', 'tagged', 'other'}),
          'validation_error': frozenset({'malformed_json', 'duplicate_fields', 'not_object',
          'missing_fields', 'extra_fields', 'wrong_types', 'reply_required',
-         'silent_reply_nonempty', 'reply_too_long', 'invalid_settings'}),
-         'schema_name': frozenset({'reply_decision', 'character_settings'}),
+         'silent_reply_nonempty', 'reply_too_long', 'invalid_settings', 'wrong_types', 'too_long'}),
+         'schema_name': frozenset({'reply_decision', 'character_settings', 'place_recommendations'}),
+         'search_site': frozenset({'afisha.yandex.ru', 'yandex.ru/maps'}),
+         'search_recency': frozenset({'day', 'week', 'month', 'year'}),
          'format_mode': frozenset({'json_schema', 'json_object'}),
          'json_repair_mode': frozenset({'format_only'}),
-         'requested_tool': frozenset({'load_skill', 'search_web', 'web_search', 'read_yandex_reviews', 'other'}),
+         'requested_tool': frozenset({'load_skill', 'search_web', 'web_search', 'read_yandex_reviews',
+                                     'read_afisha_listing', 'read_afisha_event', 'other'}),
          'tool_error': frozenset({'tools_disabled', 'step_limit', 'multiple_calls', 'unknown_tool',
                                 'missing_call_id', 'argument_type', 'arguments_too_long',
                                 'malformed_arguments', 'invalid_arguments', 'repeated_skill_limit',
@@ -61,7 +65,8 @@ ENUMS = {'parser_error': frozenset({'expected_value', 'extra_data', 'expected_ke
                               'invalid_review_call', 'browser_unavailable', 'browser_failed', 'timeout', 'captcha',
                               'not_found', 'access_denied', 'redirected', 'reviews_not_loaded', 'no_review_texts',
                               'busy', 'invalid_url', 'context_budget', 'too_many_calls', 'review_limit',
-                              'unexpected_error', 'retry_scheduled', 'gave_up'})}
+                              'unexpected_error', 'retry_scheduled', 'gave_up', 'invalid_arguments', 'no_events',
+                              'event_not_loaded'})}
 
 VALIDATION_DETAILS = {
     'malformed_json': 'Ответ не удалось разобрать как JSON.',
@@ -74,6 +79,8 @@ VALIDATION_DETAILS = {
     'silent_reply_nonempty': 'respond=false, но reply содержит текст.',
     'reply_too_long': 'reply превышает ограничение 3500 символов.',
     'invalid_settings': 'Настройки персонажа не соответствуют допустимым полям, типам или ограничениям.',
+    'wrong_types': 'Поле подборки имеет неверный тип или неизвестный kind.',
+    'too_long': 'Поле подборки длиннее лимита схемы или карточек больше пяти.',
 }
 PARSER_DETAILS = {
     'expected_value': 'В указанной позиции ожидалось JSON-значение.',
@@ -130,7 +137,7 @@ def event(name, *, level=logging.INFO, **fields):
         elif key in {'json_request_id', 'search_request_id', 'reviews_request_id'} and isinstance(value, str) and re.fullmatch(r'[0-9a-f]{32}', value):
             data[key] = value
         elif key in {'responded', 'web_search_enabled', 'previous_answer_included', 'error_feedback_included',
-                     'explicit_search_available'} and type(value) is bool:
+                     'explicit_search_available', 'filters_applied'} and type(value) is bool:
             data[key] = value
     if name in {'ai_output_invalid', 'ai_json_repair_started', 'ai_json_repair_failed',
                 'ai_json_repair_exhausted'} and data.get('validation_error') in VALIDATION_DETAILS:
@@ -143,7 +150,7 @@ def event(name, *, level=logging.INFO, **fields):
     LOGGER.log(level, name, extra={'event_data': data})
 
 
-def skill_event(phase, *, request_id, provider, model, content=None):
+def skill_event(phase, *, request_id, provider, model, name, content=None):
     """Audit validated skill metadata; hash the returned body without logging it."""
     if phase not in {'requested', 'returned', 'failed'}:
         return
@@ -151,17 +158,19 @@ def skill_event(phase, *, request_id, provider, model, content=None):
         return
     if phase == 'returned' and not isinstance(content, str):
         return
-    name = 'skill_' + phase
-    data = {'event': name, 'skill_request_id': request_id, 'tool': 'load_skill',
-            'requested': {'name': SKILL_NAME}}
+    if name not in SKILL_NAMES:
+        return
+    event_name = 'skill_' + phase
+    data = {'event': event_name, 'skill_request_id': request_id, 'tool': 'load_skill',
+            'requested': {'name': name}}
     for key, value in (('provider', provider), ('model', model)):
         if isinstance(value, str) and value in ENUMS[key]:
             data[key] = value
     if phase == 'returned':
-        data['returned'] = {'name': SKILL_NAME,
+        data['returned'] = {'name': name,
                             'sha256': hashlib.sha256(content.encode('utf-8')).hexdigest()}
         data['returned_chars'] = len(content)
     elif phase == 'failed':
         data['reason'] = 'skill_loading_failed'
     LOGGER.log(logging.WARNING if phase == 'failed' else logging.INFO,
-               name, extra={'event_data': data})
+               event_name, extra={'event_data': data})

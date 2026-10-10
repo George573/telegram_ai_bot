@@ -19,7 +19,8 @@ from service import Service
 from storage import BudgetExceeded
 from test_service import MemoryStore, FakeModel, FakeTelegram, payload
 from test_clients import Allowance
-from nearby_places import instructions as place_instructions
+from skill_registry import instructions as _load_skill_body
+def place_instructions(name='nearby-places'): return _load_skill_body(name)
 
 
 def update(kind='photo', text='', reply=False, **extra):
@@ -134,20 +135,28 @@ class SearchAndMediaModelTests(unittest.TestCase):
         requests = []
         def create(**kwargs):
             requests.append(kwargs)
-            return SimpleNamespace(status='completed', output_text='Exhibition near the metro',
-                usage=SimpleNamespace(input_tokens=100, output_tokens=10), output=[
-                {'type': 'web_search_call'}, {'type': 'message', 'content': [{'annotations': [
-                    {'type': 'url_citation', 'url': 'https://example.com/exhibition', 'title': 'Exhibition'}]}]}])
+            usage = SimpleNamespace(input_tokens=100, output_tokens=10)
+            if kwargs.get('tools', [{}])[0].get('type') == 'web_search':
+                # The separate OpenAI search request returns cited findings.
+                return SimpleNamespace(status='completed', output_text='Exhibition near the metro', usage=usage,
+                    output=[{'type': 'message', 'content': [{'annotations': [{'type': 'url_citation',
+                        'url': 'https://example.com/exhibition', 'title': 'Exhibition', 'start_index': 0, 'end_index': 25}]}]}])
+            if len(requests) == 1:
+                return SimpleNamespace(status='completed', output_text='', usage=usage, output=[
+                    {'type': 'function_call', 'call_id': 'c1', 'name': 'search_web',
+                     'arguments': '{"query":"exhibitions metro","site":null,"recency":"week"}'}])
+            return SimpleNamespace(status='completed', output_text='Exhibition near the metro', usage=usage, output=[])
         model = self.model(create)
         store, telegram = MemoryStore(), FakeTelegram()
         store.chat['web_enabled'] = True
         service = Service(model.config, store, telegram, model)
         service.accept(1, payload('/chat find current exhibitions near the metro'))
         for _ in range(3): service.process_one()
-        self.assertEqual(requests[0]['tool_choice'], 'auto')
+        self.assertNotIn('tool_choice', requests[0])
         self.assertNotIn(place_instructions(), requests[0]['instructions'])
-        self.assertEqual(requests[0]['tools'][1]['name'], 'load_skill')
-        self.assertIn('Current UTC date:', requests[0]['instructions'])
+        self.assertEqual(requests[0]['tools'][0]['name'], 'load_skill')
+        self.assertIn('Current date (Moscow):', requests[0]['instructions'])
+        self.assertEqual(requests[1]['tools'][0]['type'], 'web_search')
         self.assertIn('https://example.com/exhibition', telegram.sent[-1])
         service.accept(2, payload('/chat which is closest?'))
         service.process_one()
@@ -155,24 +164,43 @@ class SearchAndMediaModelTests(unittest.TestCase):
         previous_answer = requests[-1]['input'][-2]
         self.assertEqual(previous_answer['role'], 'assistant')
         self.assertIn('https://example.com/exhibition', previous_answer['content'])
-    def test_search_and_local_skill_tools_are_capped_and_charged_with_links(self):
+    def test_openai_search_is_a_filtered_hosted_call_with_snippets_and_token_charge(self):
         params = []
         def create(**kwargs):
             params.append(kwargs)
-            return SimpleNamespace(status='completed', output_text='Current fact',
-                usage=SimpleNamespace(input_tokens=100, output_tokens=10), output=[
-                {'type': 'web_search_call'}, {'type': 'message', 'content': [{'annotations': [
-                    {'type': 'url_citation', 'url': 'https://example.com/fact', 'title': 'Source'}]}]}])
+            return SimpleNamespace(status='completed', output_text='- Cafe on Arbat serves brunch.\n- Other',
+                usage=SimpleNamespace(input_tokens=5000, output_tokens=200), output=[
+                {'type': 'web_search_call', 'action': {'type': 'search', 'sources': [
+                    {'type': 'url', 'url': 'https://yandex.ru/maps/org/cafe/1/'}, {'type': 'url', 'url': 'http://10.0.0.1/'}]}},
+                {'type': 'message', 'content': [{'annotations': [
+                    {'type': 'url_citation', 'url': 'https://example.com/fact', 'title': 'Source',
+                     'start_index': 2, 'end_index': 30}]}]}])
         allowance = Allowance()
-        answer = self.model(create, allowance).generate('Cat', [{'role': 'user', 'content': 'Latest news?'}], allow_search=True)
-        self.assertEqual(params[0]['tools'][0], {'type': 'web_search', 'search_context_size': 'low'})
-        self.assertEqual(params[0]['tools'][1]['name'], 'load_skill')
-        self.assertEqual(params[0]['tools'][2]['name'], 'read_yandex_reviews')
-        self.assertEqual(len(params[0]['tools']), 3)
-        self.assertEqual(params[0]['max_tool_calls'], 1)
-        self.assertEqual(params[0]['tool_choice'], 'auto')
-        self.assertIn('https://example.com/fact', answer)
+        results, applied = self.model(create, allowance)._search_web('кафе Арбат', 'yandex.ru/maps', 'week')
+        tool = params[0]['tools'][0]
+        self.assertEqual(tool['filters'], {'allowed_domains': ['yandex.ru']})
+        self.assertEqual(tool['user_location']['city'], 'Moscow')
+        self.assertEqual(params[0]['tool_choice'], 'required')
+        self.assertEqual(params[0]['include'], ['web_search_call.action.sources'])
+        self.assertIn('Яндекс Карты', params[0]['input'][0]['content'])
+        self.assertIn('the last week', params[0]['instructions'])
+        self.assertEqual([r['url'] for r in results], ['https://example.com/fact', 'https://yandex.ru/maps/org/cafe/1/'])
+        self.assertIn('brunch', results[0]['content'])
+        self.assertTrue(applied)
+        # Flat tool fee plus the search request's own tokens.
         self.assertGreater(allowance.total, WEB_CALL_COST)
+
+    def test_both_providers_offer_identical_local_tools(self):
+        params = []
+        def create(**kwargs):
+            params.append(kwargs)
+            return SimpleNamespace(status='completed', output_text='Hello', usage=None, output=[])
+        self.model(create).generate('Cat', [{'role': 'user', 'content': 'Latest news?'}], allow_search=True)
+        tools = params[0]['tools']
+        self.assertEqual([tool['name'] for tool in tools], ['load_skill', 'search_web', 'read_yandex_reviews',
+                                                            'read_afisha_listing', 'read_afisha_event'])
+        self.assertTrue(all(tool['type'] == 'function' and tool['strict'] for tool in tools))
+        self.assertNotIn('maxLength', json.dumps(tools))
     def test_search_disabled_no_tool_fee_and_silent_decisions_not_sent(self):
         def create(**kwargs):
             self.assertNotIn('tools', kwargs)
@@ -182,7 +210,7 @@ class SearchAndMediaModelTests(unittest.TestCase):
     def test_missing_skill_fails_before_request_and_reservation(self):
         allowance = Allowance()
         model = self.model(lambda **_: self.fail('No request without bundled instructions'), allowance)
-        with patch('model.place_catalog', side_effect=FileNotFoundError('synthetic-private-path')):
+        with patch('model.skill_catalog', side_effect=FileNotFoundError('synthetic-private-path')):
             with self.assertRaises(ModelFailure) as caught:
                 model.generate('Find a cafe', [], allow_search=True)
         self.assertEqual(allowance.total, 0)
@@ -191,7 +219,7 @@ class SearchAndMediaModelTests(unittest.TestCase):
         allowance = Allowance()
         def create(**_): raise RuntimeError('fake-secret')
         with self.assertRaises(ModelFailure): self.model(create, allowance).generate('Cat', [], allow_search=True)
-        self.assertGreater(allowance.total, WEB_CALL_COST)
+        self.assertGreater(allowance.total, 0)
     def test_budget_rejection_prevents_search_or_image_request(self):
         allowance = Allowance()
         allowance.reserve = lambda *_: (_ for _ in ()).throw(BudgetExceeded())

@@ -176,18 +176,31 @@ class ClientTests(unittest.TestCase):
                 self.assertIn(b'gpt-transcribe', request.content)
                 return httpx.Response(200, json={'text': 'Hello', 'languages': [{'code': 'en'}]})
             body = json.loads(request.content)
-            self.assertEqual(body['max_tool_calls'], 1)
-            self.assertEqual(body['tools'][0]['type'], 'web_search')
-            self.assertEqual(body['tool_choice'], 'required')
-            return httpx.Response(200, json={'id': 'resp_fake', 'object': 'response', 'created_at': 1,
-                'model': 'gpt-6-luna', 'status': 'completed', 'error': None, 'incomplete_details': None,
-                'output': [{'type': 'message', 'id': 'msg_fake', 'role': 'assistant', 'status': 'completed',
-                            'content': [{'type': 'output_text', 'text': 'Hello', 'annotations': []}]}],
-                'usage': {'input_tokens': 10, 'output_tokens': 2, 'total_tokens': 12}})
+            base = {'id': 'resp_fake', 'object': 'response', 'created_at': 1, 'model': 'gpt-6-luna',
+                    'status': 'completed', 'error': None, 'incomplete_details': None,
+                    'usage': {'input_tokens': 10, 'output_tokens': 2, 'total_tokens': 12}}
+            def message(text, annotations=()):
+                return [{'type': 'message', 'id': 'msg_fake', 'role': 'assistant', 'status': 'completed',
+                         'content': [{'type': 'output_text', 'text': text, 'annotations': list(annotations)}]}]
+            if body['tools'][0]['type'] == 'web_search':
+                # The separate hosted search request.
+                self.assertEqual(body['tool_choice'], 'required')
+                self.assertEqual(body['tools'][0]['user_location']['country'], 'RU')
+                return httpx.Response(200, json={**base, 'output': message('Fact', [{'type': 'url_citation',
+                    'url': 'https://example.com/fact', 'title': 'Fact', 'start_index': 0, 'end_index': 4}])})
+            self.assertTrue(all(tool['type'] == 'function' for tool in body['tools']))
+            if len([r for r in requests if not r.url.path.endswith('/audio/transcriptions')]) == 1:
+                self.assertEqual(body['tool_choice'], {'type': 'function', 'name': 'search_web'})
+                return httpx.Response(200, json={**base, 'output': [{'type': 'function_call', 'id': 'fc', 'call_id': 'c',
+                    'name': 'search_web', 'arguments': '{"query":"fact","site":null,"recency":null}', 'status': 'completed'}]})
+            self.assertNotIn('tool_choice', body)
+            return httpx.Response(200, json={**base, 'output': message('Hello')})
         http = httpx.Client(transport=httpx.MockTransport(handler), trust_env=False)
         self.addCleanup(http.close)
         client = OpenAI(api_key='fake-key', http_client=http, max_retries=0)
         model = Model(Config('fake', 'fake', frozenset({-1})), Allowance(), client)
-        self.assertEqual(model.generate('Cat', [], allow_search=True, require_search=True), 'Hello')
+        answer = model.generate('Cat', [], allow_search=True, require_search=True)
+        self.assertTrue(answer.startswith('Hello'))
+        self.assertIn('https://example.com/fact', answer)
         self.assertEqual(model.transcribe(b'fake-wav', 1), 'Hello')
-        self.assertEqual(len(requests), 2)
+        self.assertEqual(len(requests), 4)

@@ -162,7 +162,7 @@ class BrowserReaderTests(unittest.TestCase):
         async def hang():
             await asyncio.sleep(3600)
         browser.close = hang
-        with patch('review_browser.CLOSE_TIMEOUT', 0.01):
+        with patch('browser.CLOSE_TIMEOUT', 0.01):
             self.assertEqual(self.read(manager)['status'], 'ok')
 
     def test_browser_captcha_not_found_redirect_and_exception_are_safe(self):
@@ -279,7 +279,7 @@ class ReviewToolTests(unittest.TestCase):
                  ToolCall('read', 'read_yandex_reviews', '{"url":"https://yandex.ru/maps/-/CCUshort"}'))
         with patch.object(model, '_generation_attempt', side_effect=[Generation('', True, tool_calls=calls),
                 Generation('Answer', True)]) as generate, \
-                patch('model.read_reviews') as read, patch.object(model, '_search_web', return_value=[]) as search:
+                patch('model.read_reviews') as read, patch.object(model, '_search_web', return_value=([], True)) as search:
             self.assertEqual(model.generate('Lookup', [], allow_search=True), 'Answer')
         read.assert_not_called()
         search.assert_called_once()

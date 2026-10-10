@@ -245,18 +245,17 @@ class ProviderTests(unittest.TestCase):
         self.assertNotIn('tools', calls[0])
         self.assertEqual(allowance.total, 0)
 
-    def test_service_zai_natural_lookup_enables_native_search(self):
+    def test_service_zai_natural_lookup_offers_function_search(self):
         store, telegram = MemoryStore(), FakeTelegram()
         store.chat['web_enabled'] = True
         model, allowance, calls = self.model()
         service = Service(self.config(), store, telegram, model)
         service.accept(1, payload('/chat find current exhibitions'))
         for _ in range(3): service.process_one()
-        self.assertEqual(calls[0]['tools'][0]['type'], 'web_search')
-        self.assertTrue(calls[0]['tools'][0]['web_search']['enable'])
+        self.assertEqual({tool['type'] for tool in calls[0]['tools']}, {'function'})
+        self.assertIn('search_web', [tool['function']['name'] for tool in calls[0]['tools']])
         self.assertEqual(telegram.sent[-1], 'Hello')
         self.assertEqual(store.rows[-1]['role'], 'assistant')
-        self.assertGreaterEqual(allowance.total, Decimal('0.01'))
 
     def test_zai_vision_sdk_request_uses_photo_model_and_its_prices(self):
         import base64

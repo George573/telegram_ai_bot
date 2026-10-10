@@ -17,6 +17,8 @@ from service import Service
 from storage import BudgetExceeded
 from test_clients import Allowance
 from test_service import MemoryStore, FakeTelegram, FakeModel, payload
+from providers import SearchOutcome
+from test_skill_loading import cards
 
 
 class SearchTests(unittest.TestCase):
@@ -49,13 +51,14 @@ class SearchTests(unittest.TestCase):
             self.assertEqual(evidence['result_count'], 1)
             self.assertEqual(evidence['results'][0]['content'], 'Evidence from public page')
             self.assertNotIn('private', tool_results[-1]['content'])
-            return self.response(text='Found Cafe')
+            return self.response(text=cards('Found Cafe'))
         model = self.model(handler)
         with patch('model.event') as log:
             answer = model.generate('Find nearby cafes', [{'role': 'user', 'content': 'кафе Щёлковская'}], allow_search=True)
         self.assertIn('https://example.com/cafe', answer)
         self.assertEqual(len(requests), 4)
-        self.assertEqual(model.store.total, Decimal('0.040291'))
+        # Three generations (no per-round hosted search fee) plus one search_web fee.
+        self.assertEqual(model.store.total, Decimal('0.010291'))
         events = [call for call in log.call_args_list if call.args[0].startswith('web_search_')]
         self.assertEqual([call.args[0] for call in events], ['web_search_started', 'web_search_completed'])
         self.assertEqual(events[-1].kwargs['result_count'], 1)
@@ -137,7 +140,7 @@ class SearchTests(unittest.TestCase):
             ToolCall(f'call{i}', 'search_web', '{"query":"public query"}'),)) for i in range(4)]
         responses.append(Generation('Done', True))
         with patch.object(model, '_generation_attempt', side_effect=responses), \
-                patch.object(model.provider, 'search', return_value=[]) as search:
+                patch.object(model.provider, 'search', return_value=SearchOutcome([])) as search:
             self.assertEqual(model.generate('Lookup', [], allow_search=True), 'Done')
         self.assertEqual(search.call_count, 4)
 
@@ -151,7 +154,7 @@ class SearchTests(unittest.TestCase):
             ToolCall(f'last{i}', 'search_web', '{"query":"public query"}') for i in range(8))))
         responses.append(Generation('Done', True))
         with patch.object(model, '_generation_attempt', side_effect=responses) as generate, \
-                patch.object(model.provider, 'search', return_value=[]) as search:
+                patch.object(model.provider, 'search', return_value=SearchOutcome([])) as search:
             self.assertEqual(model.generate('Lookup', [], allow_search=True), 'Done')
         self.assertEqual(generate.call_count, 6)
         self.assertEqual(search.call_count, 8)
@@ -204,7 +207,7 @@ class SearchTests(unittest.TestCase):
             ToolCall(f'call{i}', 'search_web', '{"query":"public query"}'),)) for i in range(5)]
         responses.append(BudgetExceeded())
         with patch.object(model, '_generation_attempt', side_effect=responses) as generate, \
-                patch.object(model.provider, 'search', return_value=[]) as search, patch('model.event') as log:
+                patch.object(model.provider, 'search', return_value=SearchOutcome([])) as search, patch('model.event') as log:
             with self.assertRaises(BudgetExceeded):
                 model.generate('Lookup', [], allow_search=True)
         self.assertEqual(generate.call_count, 6)
@@ -232,7 +235,7 @@ class SearchTests(unittest.TestCase):
             assistants = [message for message in body['messages'] if message['role'] == 'assistant']
             self.assertEqual(len(assistants), 2)
             self.assertEqual(len(assistants[-1]['tool_calls']), 8)
-            return self.response(text='Found Cafe')
+            return self.response(text=cards('Found Cafe'))
         with patch('model.event') as log:
             answer = self.model(handler).generate('Lookup', [], allow_search=True)
         self.assertIn('https://example.com/cafe', answer)
@@ -256,8 +259,8 @@ class SearchTests(unittest.TestCase):
                 return httpx.Response(200, json=document)
             tools = [message for message in body['messages'] if message['role'] == 'tool']
             self.assertEqual([message['tool_call_id'] for message in tools], ['skill', 'search'])
-            return self.response(text='No results')
-        self.assertEqual(self.model(handler).generate('Lookup', [], allow_search=True), 'No results')
+            return self.response(text=cards('No results'))
+        self.assertIn('No results', self.model(handler).generate('Lookup', [], allow_search=True))
         self.assertEqual(len(requests), 3)
 
     def test_batch_is_fully_validated_before_any_search_or_skill_read(self):
@@ -272,7 +275,7 @@ class SearchTests(unittest.TestCase):
             with self.subTest(error=error):
                 model = self.model(lambda _: self.fail('No HTTP allowed'))
                 with patch.object(model, '_generation_attempt', return_value=Generation('', True, tool_calls=calls)), \
-                        patch.object(model.provider, 'search') as search, patch('model.place_instructions') as load, \
+                        patch.object(model.provider, 'search') as search, patch('model.skill_instructions') as load, \
                         patch('model.event') as log:
                     with self.assertRaises(ModelFailure):
                         model.generate('Lookup', [], allow_search=True)
@@ -297,25 +300,67 @@ class SearchTests(unittest.TestCase):
             'usage': {'prompt_tokens': 100, 'completion_tokens': 10, 'total_tokens': 110},
             'web_search': results or []})
 
-    def test_native_search_request_citations_and_conservative_tool_charge(self):
+    def test_only_local_function_tools_are_offered(self):
         def handler(request):
             body = json.loads(request.content)
-            tool = body['tools'][0]
-            self.assertEqual(tool['type'], 'web_search')
-            self.assertEqual(tool['web_search']['search_engine'], 'search-prime')
-            self.assertTrue(tool['web_search']['enable'])
-            self.assertEqual(tool['web_search']['count'], 3)
-            return self.response([{'title': 'Fact', 'link': 'https://example.com/fact'},
-                                  {'title': 'Unsafe', 'link': 'http://127.0.0.1/private'},
-                                  {'title': 'Credential', 'link': 'https://secret@example.com'},
-                                  {'title': 'Duplicate', 'link': 'https://example.com/fact'}])
+            self.assertEqual({tool['type'] for tool in body['tools']}, {'function'})
+            names = [tool['function']['name'] for tool in body['tools']]
+            self.assertEqual(names, ['load_skill', 'search_web', 'read_yandex_reviews',
+                                     'read_afisha_listing', 'read_afisha_event'])
+            return self.response()
+        self.assertEqual(self.model(handler).generate('Cat', [], allow_search=True), 'Hello')
+
+    def test_structured_search_maps_site_and_recency_to_zai_filters_and_keeps_safe_results(self):
+        bodies = []
+        def handler(request):
+            body = json.loads(request.content)
+            bodies.append(body)
+            return httpx.Response(200, json={'search_result': [
+                {'title': 'Fact', 'link': 'https://afisha.yandex.ru/moscow/theatre/x'},
+                {'title': 'Unsafe', 'link': 'http://127.0.0.1/private'},
+                {'title': 'Credential', 'link': 'https://secret@example.com'},
+                {'title': 'Duplicate', 'link': 'https://afisha.yandex.ru/moscow/theatre/x'}]})
         model = self.model(handler)
-        answer = model.generate('Cat', [], allow_search=True)
-        self.assertIn('https://example.com/fact', answer)
-        self.assertNotIn('127.0.0.1', answer)
-        self.assertNotIn('secret@', answer)
-        self.assertEqual(answer.count('https://example.com/fact'), 1)
-        self.assertEqual(model.store.total, Decimal('0.010097'))
+        outcome = model.provider.search('спектакль', 'afisha.yandex.ru', 'week')
+        self.assertEqual(bodies[0], {'search_engine': 'search-prime', 'search_query': 'спектакль', 'count': 5,
+                                     'search_domain_filter': 'afisha.yandex.ru', 'search_recency_filter': 'oneWeek'})
+        self.assertEqual([r['url'] for r in outcome.results], ['https://afisha.yandex.ru/moscow/theatre/x'])
+        self.assertTrue(outcome.filters_applied)
+        model.provider.search('кафе', 'yandex.ru/maps', None)
+        self.assertEqual(bodies[1]['search_query'], 'кафе Яндекс Карты')
+        self.assertEqual(bodies[1]['search_domain_filter'], 'yandex.ru')
+
+    def test_rejected_zai_filters_fall_back_to_a_site_query(self):
+        bodies = []
+        def handler(request):
+            body = json.loads(request.content)
+            bodies.append(body)
+            if 'search_domain_filter' in body:
+                return httpx.Response(400, json={'error': {'code': '1214', 'message': 'synthetic'}})
+            return httpx.Response(200, json={'search_result': []})
+        outcome = self.model(handler).provider.search('концерт', 'afisha.yandex.ru', None)
+        self.assertEqual(bodies[1], {'search_engine': 'search-prime', 'count': 5,
+                                     'search_query': 'site:afisha.yandex.ru концерт'})
+        self.assertFalse(outcome.filters_applied)
+
+    def test_search_call_passes_structured_arguments_and_echoes_them(self):
+        model = self.model(lambda _: self.fail('Mocked generation and search only'))
+        from providers import Generation, ToolCall
+        call = ToolCall('c', 'search_web', '{"query":"джаз","site":"afisha.yandex.ru","recency":"month"}')
+        with patch.object(model, '_generation_attempt', side_effect=[Generation('', True, tool_calls=(call,)),
+                Generation('Done', True)]) as generate, \
+                patch.object(model.provider, 'search', return_value=SearchOutcome([])) as search:
+            model.generate('Lookup', [], allow_search=True)
+        self.assertEqual(search.call_args.args, ('джаз', 'afisha.yandex.ru', 'month'))
+        result = json.loads(generate.call_args.kwargs['continuation'][-1]['content'])
+        self.assertEqual((result['site'], result['recency']), ('afisha.yandex.ru', 'month'))
+        for bad in ('{"query":"x","site":"evil.example"}', '{"query":"x","recency":"decade"}'):
+            with self.subTest(arguments=bad):
+                bad_call = ToolCall('c', 'search_web', bad)
+                with patch.object(model, '_generation_attempt', return_value=Generation('', True, tool_calls=(bad_call,))), \
+                        patch.object(model.provider, 'search') as search, self.assertRaises(ModelFailure):
+                    model.generate('Lookup', [], allow_search=True)
+                search.assert_not_called()
 
     def test_disabled_search_sends_no_tool_or_fee(self):
         def handler(request):
@@ -325,10 +370,10 @@ class SearchTests(unittest.TestCase):
         self.assertEqual(model.generate('Cat', [], allow_search=False), 'Hello')
         self.assertEqual(model.store.total, Decimal('0.000097'))
 
-    def test_enabled_search_without_results_keeps_one_tool_fee_estimate(self):
+    def test_enabled_search_without_a_search_call_charges_no_tool_fee(self):
         model = self.model(lambda _: self.response())
         self.assertEqual(model.generate('Cat', [], allow_search=True), 'Hello')
-        self.assertEqual(model.store.total, Decimal('0.010097'))
+        self.assertEqual(model.store.total, Decimal('0.000097'))
 
     def test_search_budget_rejection_never_calls_network(self):
         store = Allowance()
@@ -337,16 +382,23 @@ class SearchTests(unittest.TestCase):
         with self.assertRaises(BudgetExceeded): model.generate('Cat', [], allow_search=True)
 
     def test_search_works_with_json_decisions_and_safe_sources(self):
+        generations = []
         def handler(request):
-            from nearby_places import instructions as place_instructions
+            from skill_registry import instructions as _load_skill_body
             body = json.loads(request.content)
+            if request.url.path.endswith('/web_search'):
+                return httpx.Response(200, json={'search_result': [
+                    {'title': 'Fact', 'link': 'https://example.com/fact'}, {'title': 'Bad', 'link': 'http://10.0.0.1/'}]})
+            generations.append(body)
             self.assertEqual(body['response_format'], {'type': 'json_object'})
-            self.assertEqual(body['tools'][0]['type'], 'web_search')
-            self.assertNotIn(place_instructions(), body['messages'][0]['content'])
-            self.assertEqual(body['tools'][1]['function']['name'], 'load_skill')
-            return self.response([{'title': 'Fact', 'link': 'https://example.com/fact'}],
-                                 '{"respond":true,"reply":"Fact"}')
-        self.assertIn('https://example.com/fact', self.model(handler).decide_reply('Cat', [], allow_search=True))
+            self.assertNotIn(_load_skill_body('nearby-places'), body['messages'][0]['content'])
+            if len(generations) == 1:
+                self.assertEqual(body['tools'][0]['function']['name'], 'load_skill')
+                return self.tool_response('search_web', '{"query":"public fact","site":null,"recency":null}')
+            return self.response(text='{"respond":true,"reply":"Fact"}')
+        answer = self.model(handler).decide_reply('Cat', [], allow_search=True)
+        self.assertIn('https://example.com/fact', answer)
+        self.assertNotIn('10.0.0.1', answer)
 
 
 class TypingTests(unittest.TestCase):

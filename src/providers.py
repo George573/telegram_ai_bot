@@ -8,8 +8,9 @@ import math
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from urllib.parse import urlsplit
-from openai import OpenAI
-from nearby_places import LOAD_SKILL
+from openai import OpenAI, BadRequestError
+from skill_registry import LOAD_SKILL
+from yandex_afisha import READ_AFISHA_EVENT, READ_AFISHA_LISTING
 from yandex_reviews import READ_YANDEX_REVIEWS
 
 PRICES = {
@@ -32,12 +33,62 @@ VOICE_MAX_SECONDS = {'openai': 300, 'zai': 30}
 TRANSCRIPTION_RATES = {'openai': Decimal('0.0045'), 'zai': Decimal('0.0024')}
 IMAGE_MAX_BYTES = {'openai': 10 * 1024 * 1024, 'zai': 5 * 1024 * 1024}
 WEB_CALL_COST = Decimal('0.01')
+SEARCH_SITES = ('afisha.yandex.ru', 'yandex.ru/maps')
+SEARCH_RECENCY = ('day', 'week', 'month', 'year')
 SEARCH_WEB = {'name': 'search_web',
-    'description': 'Search the public web now and return titles, URLs and evidence snippets. '
-                   'Use this for current places, cafes, exhibitions and factual lookups; never ask the user to run /search.',
-    'parameters': {'type': 'object', 'properties': {'query': {'type': 'string', 'minLength': 1, 'maxLength': 400}},
-                   'required': ['query'], 'additionalProperties': False}}
+    'description': 'Search the public web now and return titles, URLs and evidence snippets. Use it for current '
+                   'places, events and factual lookups; never ask the user to run /search. site restricts results '
+                   '(afisha.yandex.ru for events, yandex.ru/maps for organization cards) or null for the whole web; '
+                   'recency limits results to the last day/week/month/year, or null.',
+    'parameters': {'type': 'object', 'properties': {
+        'query': {'type': 'string', 'maxLength': 400},
+        'site': {'type': ['string', 'null'], 'enum': [*SEARCH_SITES, None]},
+        'recency': {'type': ['string', 'null'], 'enum': [*SEARCH_RECENCY, None]}},
+        'required': ['query', 'site', 'recency'], 'additionalProperties': False}}
+READERS = (READ_YANDEX_REVIEWS, READ_AFISHA_LISTING, READ_AFISHA_EVENT)
+# Search requests leave the bot with a fixed location hint, never user data.
+SEARCH_LOCATION = {'type': 'approximate', 'country': 'RU', 'city': 'Moscow', 'timezone': 'Europe/Moscow'}
+RECENCY_HINTS = {'day': 'the last day', 'week': 'the last week', 'month': 'the last month', 'year': 'the last year'}
 TRANSCRIPTION_PER_MINUTE = TRANSCRIPTION_RATES['openai']
+
+
+def strict_schema(schema):
+    """Drop string length keywords for OpenAI strict mode; Model validates lengths itself."""
+    if isinstance(schema, dict):
+        return {key: strict_schema(value) for key, value in schema.items() if key not in {'minLength', 'maxLength'}}
+    if isinstance(schema, list):
+        return [strict_schema(value) for value in schema]
+    return schema
+
+
+def function_tools(allow_search, skill_enabled, readers_enabled):
+    """The same local tools for every provider, in a fixed order."""
+    tools = [SEARCH_WEB] if allow_search else []
+    if skill_enabled:
+        tools.insert(0, LOAD_SKILL)  # Keep skill discovery first.
+    return tools + (list(READERS) if readers_enabled else [])
+
+
+def search_query(query, site):
+    # Maps cards cannot be domain-filtered by path; name the service instead.
+    return query + ' Яндекс Карты' if site == 'yandex.ru/maps' and 'карт' not in query.casefold() else query
+
+
+@dataclass(frozen=True)
+class SearchOutcome:
+    results: list
+    input_tokens: int = 0
+    output_tokens: int = 0
+    filters_applied: bool = True
+
+
+def safe_result(url, title, content='', publish_date=''):
+    safe = citation_sources({'output': [{'type': 'message', 'content': [{'annotations': [
+        {'type': 'url_citation', 'url': url, 'title': title or 'Source'}]}]}]})
+    if not safe:
+        return None
+    return {'title': safe[0][0], 'url': safe[0][1], 'content': str(content or '')[:2000],
+            'publish_date': str(publish_date or '')[:40]}
 
 
 def model_prices(provider, model):
@@ -182,20 +233,20 @@ class OpenAIProvider:
 
     def generate(self, *, model, instructions, history, output_tokens,
                  response_format=None, allow_search=False, image=None, require_search=False,
-                 skill_enabled=False, continuation=(), reviews_enabled=False):
-        extra = {'text': {'format': response_format}} if response_format else {}
+                 skill_enabled=False, continuation=(), readers_enabled=False):
+        extra = {'text': {'format': {**response_format, 'schema': strict_schema(response_format['schema'])}}} if response_format else {}
         if image is not None:
             encoded = base64.b64encode(image).decode('ascii')
             history = history + [{'role': 'user', 'content': [
                 {'type': 'input_image', 'image_url': 'data:image/jpeg;base64,' + encoded, 'detail': 'low'}]}]
-        if allow_search:
-            extra.update(tools=[{'type': 'web_search', 'search_context_size': 'low'}],
-                         tool_choice='required' if require_search else 'auto', max_tool_calls=1)
+        tools = function_tools(allow_search, skill_enabled, readers_enabled)
+        if tools:
+            extra['tools'] = [{'type': 'function', 'name': tool['name'], 'description': tool['description'],
+                               'parameters': strict_schema(tool['parameters']), 'strict': True} for tool in tools]
+            if require_search and allow_search:
+                extra['tool_choice'] = {'type': 'function', 'name': 'search_web'}
         if skill_enabled:
-            extra.setdefault('tools', []).append({'type': 'function', **LOAD_SKILL, 'strict': True})
             extra['parallel_tool_calls'] = False
-        if reviews_enabled:
-            extra.setdefault('tools', []).append({'type': 'function', **READ_YANDEX_REVIEWS, 'strict': True})
         response = self.client.responses.create(model=model, instructions=instructions,
             input=history + list(continuation), store=False, reasoning={'effort': 'none'},
             max_output_tokens=output_tokens, **extra)
@@ -207,10 +258,42 @@ class OpenAIProvider:
                         for item in output) if calls else ()
         return Generation(response.output_text, response.status == 'completed',
             usage.input_tokens if usage else None, usage.output_tokens if usage else None,
-            tuple(citation_sources(response)) if allow_search else (),
-            sum(member(item, 'type') == 'web_search_call' for item in output),
-            tool_calls=calls, continuation=carried, finish_reason=response.status,
+            (), 0, Decimal('0'), tool_calls=calls, continuation=carried, finish_reason=response.status,
             incomplete_reason=member(member(response, 'incomplete_details'), 'reason'))
+
+    def search(self, query, site=None, recency=None, *, model):
+        """One hosted web search in a small separate request; returns cited URLs with snippets."""
+        tool = {'type': 'web_search', 'search_context_size': 'low', 'user_location': SEARCH_LOCATION}
+        if site:
+            tool['filters'] = {'allowed_domains': [site.split('/')[0]]}
+        hint = f' Prefer pages published or updated within {RECENCY_HINTS[recency]}.' if recency else ''
+        response = self.client.responses.create(model=model, store=False, reasoning={'effort': 'none'},
+            instructions=('Search the web for the query and list the relevant findings as short factual bullet '
+                          'points, each with its citation. Do not answer anything else.' + hint),
+            input=[{'role': 'user', 'content': search_query(query, site)}], tools=[tool], tool_choice='required',
+            include=['web_search_call.action.sources'], max_output_tokens=800)
+        text, results = response.output_text or '', []
+        output = member(response, 'output', []) or []
+        # Cited findings first (they carry snippets), then other sources the search consulted.
+        for item in output:
+            for content in member(item, 'content', []) or []:
+                for note in member(content, 'annotations', []) or []:
+                    if member(note, 'type') != 'url_citation':
+                        continue
+                    start, end = member(note, 'start_index', 0) or 0, member(note, 'end_index', 0) or 0
+                    # The cited sentence is the evidence snippet for this URL.
+                    line_start = text.rfind('\n', 0, max(0, start)) + 1
+                    result = safe_result(member(note, 'url', ''), member(note, 'title', ''), text[line_start:end])
+                    if result and all(existing['url'] != result['url'] for existing in results):
+                        results.append(result)
+        for item in output:
+            action = member(item, 'action')
+            for source in (member(action, 'sources', []) or []) if member(item, 'type') == 'web_search_call' else []:
+                result = safe_result(member(source, 'url', ''), urlsplit(member(source, 'url', '') or '').hostname)
+                if result and all(existing['url'] != result['url'] for existing in results):
+                    results.append(result)
+        usage = response.usage
+        return SearchOutcome(results[:5], usage.input_tokens if usage else 0, usage.output_tokens if usage else 0)
 
     def skill_result(self, call, text):
         return {'type': 'function_call_output', 'call_id': call.call_id, 'output': text}
@@ -238,7 +321,7 @@ class ZaiProvider:
 
     def generate(self, *, model, instructions, history, output_tokens,
                  response_format=None, allow_search=False, image=None, require_search=False,
-                 skill_enabled=False, continuation=(), reviews_enabled=False):
+                 skill_enabled=False, continuation=(), readers_enabled=False):
         if image is not None:
             if model not in VISION_PRICES or len(image) > IMAGE_MAX_BYTES['zai']:
                 raise ProviderFailure('Unsupported or oversized image')
@@ -247,15 +330,9 @@ class ZaiProvider:
                 {'type': 'image_url', 'image_url': {'url': 'data:image/jpeg;base64,' + encoded}},
                 {'type': 'text', 'text': 'Describe this photo.'}]}]
         extra = {}
-        if allow_search:
-            extra['tools'] = [{'type': 'web_search', 'web_search': {
-                'enable': True, 'search_engine': 'search-prime', 'search_result': True,
-                'count': 3, 'content_size': 'low'}}, {'type': 'function', 'function': SEARCH_WEB}]
-        if skill_enabled:
-            # Keep skill discovery first among local functions.
-            extra.setdefault('tools', []).insert(1 if allow_search else 0, {'type': 'function', 'function': LOAD_SKILL})
-        if reviews_enabled:
-            extra.setdefault('tools', []).append({'type': 'function', 'function': READ_YANDEX_REVIEWS})
+        tools = function_tools(allow_search, skill_enabled, readers_enabled)
+        if tools:
+            extra['tools'] = [{'type': 'function', 'function': tool} for tool in tools]
         if allow_search or skill_enabled:
             instructions += ('\nYou may call multiple functions in one response; each call receives a result. For explicit public lookup call search_web '
                 '(not a function named web_search). After load_skill returns its instructions, do not load it again.')
@@ -291,37 +368,44 @@ class ZaiProvider:
                         'name': call.name, 'arguments': call.arguments}} for call in calls]},) if calls else ()
         if carried and member(choice.message, 'reasoning_content') is not None:
             carried[0]['reasoning_content'] = member(choice.message, 'reasoning_content')
-        results = (member(response, 'web_search', []) or []) if allow_search else []
-        annotations = [{'type': 'url_citation', 'title': member(item, 'title', 'Source'),
-                        'url': member(item, 'link', '')} for item in results]
-        sources = citation_sources({'output': [{'type': 'message', 'content': [{'annotations': annotations}]}]})
         return Generation(choice.message.content or '',
             choice.finish_reason == 'stop' or (choice.finish_reason == 'tool_calls' and bool(calls)),
             usage.prompt_tokens if usage else None, usage.completion_tokens if usage else None,
-            tuple(sources), int(bool(results)), WEB_CALL_COST if allow_search else Decimal('0'), calls, carried,
-            finish_reason=choice.finish_reason)
+            (), 0, Decimal('0'), calls, carried, finish_reason=choice.finish_reason)
 
     def skill_result(self, call, text):
         return {'role': 'tool', 'tool_call_id': call.call_id, 'content': text}
 
-    def search(self, query):
+    ZAI_RECENCY = {'day': 'oneDay', 'week': 'oneWeek', 'month': 'oneMonth', 'year': 'oneYear'}
+
+    def search(self, query, site=None, recency=None, *, model=None):
         # Use the configured Z.ai client/key/base URL; no alternate provider.
-        response = self.client.post('/web_search', cast_to=dict[str, object], body={
-            'search_engine': 'search-prime', 'search_query': query, 'count': 5})
+        body = {'search_engine': 'search-prime', 'search_query': search_query(query, site), 'count': 5}
+        filters = {}
+        if site:
+            filters['search_domain_filter'] = site.split('/')[0]
+        if recency:
+            filters['search_recency_filter'] = self.ZAI_RECENCY[recency]
+        applied = bool(filters)
+        try:
+            response = self.client.post('/web_search', cast_to=dict[str, object], body={**body, **filters})
+        except BadRequestError:
+            if not filters:
+                raise
+            # Filters are documented for another engine; a rejected request is retried as a plain query.
+            applied = False
+            fallback = ('site:' + site.split('/')[0] + ' ' if site else '') + body['search_query']
+            response = self.client.post('/web_search', cast_to=dict[str, object], body={**body, 'search_query': fallback})
         if not isinstance(response, dict) or not isinstance(response.get('search_result'), list):
             raise ProviderFailure('Invalid search response')
         results = []
         for item in response['search_result'][:5]:
             if not isinstance(item, dict):
                 continue
-            safe = citation_sources({'output': [{'type': 'message', 'content': [{'annotations': [
-                {'type': 'url_citation', 'url': item.get('link'), 'title': item.get('title', 'Source')}]}]}]})
-            if not safe or any(existing['url'] == safe[0][1] for existing in results):
-                continue
-            results.append({'title': safe[0][0], 'url': safe[0][1],
-                            'content': str(item.get('content') or '')[:2000],
-                            'publish_date': str(item.get('publish_date') or '')[:40]})
-        return results
+            result = safe_result(item.get('link'), item.get('title', 'Source'), item.get('content'), item.get('publish_date'))
+            if result and all(existing['url'] != result['url'] for existing in results):
+                results.append(result)
+        return SearchOutcome(results, filters_applied=applied or not filters)
 
     def transcribe(self, wav):
         return self.client.audio.transcriptions.create(model='glm-asr-2512',

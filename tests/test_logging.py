@@ -15,8 +15,10 @@ from config import Config
 from model import Model, ModelFailure
 from storage import BudgetExceeded
 from test_clients import Allowance
-from nearby_places import instructions as skill_body
-from providers import Generation, ToolCall
+from skill_registry import instructions as _load_skill_body
+def skill_body(name='nearby-places'): return _load_skill_body(name)
+from providers import Generation, SearchOutcome, ToolCall
+from test_skill_loading import EVIDENCE, cards
 
 
 class LoggingTests(unittest.TestCase):
@@ -68,12 +70,14 @@ class LoggingTests(unittest.TestCase):
                 model = self.model(None, provider=provider)
                 call = ToolCall('synthetic-secret-call-id', 'load_skill',
                                 '{ "name" : "nearby-places" }')
-                responses = [Generation('', True, tool_calls=(call,)),
-                             Generation('private-answer', True, search_calls=1 if provider == 'zai' else 0)]
-                with patch.object(model, '_generation_attempt', side_effect=responses) as generate:
+                search = ToolCall('search', 'search_web', '{"query":"public cafe"}')
+                responses = [Generation('', True, tool_calls=(call,)), Generation('', True, tool_calls=(search,)),
+                             Generation(cards('private-answer'), True)]
+                with patch.object(model, '_generation_attempt', side_effect=responses) as generate, \
+                        patch.object(model, '_search_web', return_value=(EVIDENCE, True)):
                     model.generate('private-prompt', [{'role': 'user', 'content': 'private-message'}],
                                    allow_search=True)
-                requested, returned = self.records()
+                requested, returned = [r for r in self.records() if r['event'].startswith('skill_')]
                 self.assertEqual(requested['event'], 'skill_requested')
                 self.assertEqual(returned['event'], 'skill_returned')
                 self.assertEqual(requested['requested'], {'name': 'nearby-places'})
@@ -84,7 +88,7 @@ class LoggingTests(unittest.TestCase):
                 self.assertEqual(returned['returned'], {'name': 'nearby-places',
                     'sha256': hashlib.sha256(skill_body().encode('utf-8')).hexdigest()})
                 self.assertEqual(returned['returned_chars'], len(skill_body()))
-                continuation = generate.call_args.kwargs['continuation'][-1]
+                continuation = generate.call_args_list[1].kwargs['continuation'][-1]
                 self.assertEqual(returned['returned']['sha256'], hashlib.sha256(
                     continuation['output' if provider == 'openai' else 'content'].encode('utf-8')).hexdigest())
                 self.assertNotIn('content', returned['returned'])
@@ -98,7 +102,7 @@ class LoggingTests(unittest.TestCase):
         response = Generation('', True, tool_calls=(ToolCall('call', 'load_skill',
                                                             '{"name":"nearby-places"}'),))
         with patch.object(model, '_generation_attempt', return_value=response), \
-                patch('model.place_instructions', side_effect=OSError('synthetic-secret')):
+                patch('model.skill_instructions', side_effect=OSError('synthetic-secret')):
             with self.assertRaises(ModelFailure):
                 model.generate('private-prompt', [], allow_search=True)
         requested, failed = self.records()
@@ -114,7 +118,7 @@ class LoggingTests(unittest.TestCase):
                           '{"name":"nearby-places","token":"synthetic-secret"}'):
             response = Generation('', True, tool_calls=(ToolCall('call', 'load_skill', arguments),))
             with patch.object(model, '_generation_attempt', return_value=response), \
-                    patch('model.place_instructions') as load:
+                    patch('model.skill_instructions') as load:
                 with self.assertRaises(ModelFailure):
                     model.generate('private-prompt', [], allow_search=True)
                 load.assert_not_called()
@@ -134,15 +138,17 @@ class LoggingTests(unittest.TestCase):
     def test_general_logger_cannot_emit_arbitrary_skill_content(self):
         event('skill_returned', returned={'content': 'synthetic-secret'}, content='synthetic-secret')
         skill_event('requested', request_id='0' * 32, provider='synthetic-secret',
-                    model='synthetic-secret', content='synthetic-secret')
+                    model='synthetic-secret', name='nearby-places', content='synthetic-secret')
         skill_event('returned', request_id='synthetic-secret', provider='openai', model='gpt-6-luna',
-                    content='synthetic-secret')
+                    name='nearby-places', content='synthetic-secret')
+        skill_event('requested', request_id='0' * 32, provider='openai', model='gpt-6-luna',
+                    name='synthetic-secret')
         self.assertEqual(len(self.records()), 2)
         self.assertNotIn('synthetic-secret', self.output.getvalue())
 
     def test_return_logs_only_metadata_even_if_body_contains_sensitive_text(self):
         skill_event('returned', request_id='0' * 32, provider='openai', model='gpt-6-luna',
-                    content='Секретный текст synthetic-secret\nprivate-message')
+                    name='nearby-places', content='Секретный текст synthetic-secret\nprivate-message')
         record, = self.records()
         self.assertEqual(record['returned']['name'], 'nearby-places')
         self.assertEqual(set(record['returned']), {'name', 'sha256'})
@@ -272,7 +278,7 @@ class LoggingTests(unittest.TestCase):
         results = [{'title': 'private-title', 'url': 'https://example.com/private-url',
                     'content': 'private-evidence', 'publish_date': ''}]
         with patch.object(model, '_generation_attempt', side_effect=responses), \
-                patch.object(model.provider, 'search', return_value=results):
+                patch.object(model.provider, 'search', return_value=SearchOutcome(results)):
             model.generate('private-prompt', [], allow_search=True)
         started, completed = [record for record in self.records() if record['event'].startswith('web_search_')]
         self.assertEqual(started['event'], 'web_search_started')
