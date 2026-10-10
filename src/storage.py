@@ -242,9 +242,10 @@ class Store:
     def forget_user(self, chat_id, user_id, update_id):
         with self.transaction():
             self.conn.execute('DELETE FROM messages WHERE chat_id=%s AND sender_id=%s', (chat_id,user_id))
-            # Legacy history has no trustworthy sender metadata. Clear it too;
-            # summaries cannot safely subtract an individual speaker.
-            self.conn.execute('DELETE FROM messages WHERE chat_id=%s AND sender_id IS NULL', (chat_id,))
+            # Legacy user rows have no trustworthy sender metadata. Clear them too;
+            # summaries cannot safely subtract an individual speaker. Bot replies
+            # never carry a sender and stay.
+            self.conn.execute("DELETE FROM messages WHERE chat_id=%s AND sender_id IS NULL AND role='user'", (chat_id,))
             self.conn.execute("UPDATE conversations SET summary='',summary_started_at=NULL WHERE chat_id=%s", (chat_id,))
             self.delete_drafts(chat_id, user_id)
             self.conn.execute("DELETE FROM jobs WHERE payload->>'chat_id'=%s AND update_id<>%s AND (payload->>'user_id'=%s OR phase<>'queued')", (str(chat_id),update_id,str(user_id)))
