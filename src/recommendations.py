@@ -9,7 +9,7 @@ ICONS = {'cafe': '☕', 'restaurant': '🍽', 'bar': '🍸', 'park': '🌳', 'th
          'festival': '🎪', 'other': '📍'}
 MAX_ITEMS = 5
 LIMITS = {'intro': 300, 'name': 120, 'venue': 150, 'address': 200, 'when': 200, 'price': 100,
-          'why': 300, 'reviews': 300, 'caveats': 250, 'follow_up': 200, 'evidence_gaps': 250}
+          'why': 300, 'reviews': 300, 'caveats': 250, 'relaxed': 150, 'follow_up': 200, 'evidence_gaps': 250}
 NAME = 'place_recommendations'
 
 
@@ -17,7 +17,7 @@ def nullable(limit):
     return {'type': ['string', 'null'], 'maxLength': limit}
 
 
-ITEM_FIELDS = ('kind', 'name', 'venue', 'address', 'when', 'price', 'why', 'reviews', 'caveats', 'links')
+ITEM_FIELDS = ('kind', 'name', 'venue', 'address', 'when', 'price', 'why', 'reviews', 'caveats', 'relaxed', 'links')
 SCHEMA = {
     'type': 'object', 'additionalProperties': False,
     'required': ['intro', 'items', 'follow_up', 'evidence_gaps'],
@@ -32,6 +32,7 @@ SCHEMA = {
                 'when': nullable(LIMITS['when']), 'price': nullable(LIMITS['price']),
                 'why': {'type': 'string', 'maxLength': LIMITS['why']},
                 'reviews': nullable(LIMITS['reviews']), 'caveats': nullable(LIMITS['caveats']),
+                'relaxed': nullable(LIMITS['relaxed']),
                 'links': {'type': 'array', 'maxItems': 3, 'items': {'type': 'string', 'maxLength': 400}}}}},
         'follow_up': nullable(LIMITS['follow_up']),
         'evidence_gaps': nullable(LIMITS['evidence_gaps'])}}
@@ -39,7 +40,9 @@ FORMAT = {'type': 'json_schema', 'name': NAME, 'strict': True, 'schema': SCHEMA}
 INSTRUCTIONS = ('\nA place or event skill is active: return the final answer as one JSON object matching the '
                 'place_recommendations schema (intro, items, follow_up, evidence_gaps), not plain text. '
                 'Write intro and follow_up in the persona voice and the conversation language; keep item fields '
-                'factual. Use null for unknown fields. links may contain only URLs returned by tools in this request.')
+                'factual. Use null for unknown fields. links may contain only URLs returned by tools in this request. '
+                'For a near-miss that does not meet a soft preference, set relaxed to what is relaxed; otherwise null. '
+                'Never include an item that fails a hard requirement.')
 CORRECTIONS = {
     'malformed_json': 'Return one valid JSON object only, without Markdown fences or surrounding text.',
     'duplicate_fields': 'Include each key exactly once.',
@@ -75,6 +78,8 @@ def validate(value):
     for item in value['items']:
         if not isinstance(item, dict):
             raise RecommendationError('wrong_types')
+        # Optional for JSON-mode providers; strict schemas always send it.
+        item.setdefault('relaxed', None)
         if set(ITEM_FIELDS) - set(item):
             raise RecommendationError('missing_fields')
         if set(item) - set(ITEM_FIELDS):
@@ -83,7 +88,7 @@ def validate(value):
             raise RecommendationError('wrong_types')
         if not all(isinstance(link, str) and len(link) <= 400 for link in item['links']):
             raise RecommendationError('wrong_types')
-        for key in ('name', 'venue', 'address', 'when', 'price', 'why', 'reviews', 'caveats'):
+        for key in ('name', 'venue', 'address', 'when', 'price', 'why', 'reviews', 'caveats', 'relaxed'):
             check_text(item[key], key, nullable=key not in {'name', 'why'})
         if not item['name'].strip():
             raise RecommendationError('wrong_types')
@@ -158,6 +163,9 @@ def render(value, evidence, max_chars=3500):
             lines.append('⭐ ' + clean(item['reviews']))
         if item['caveats']:
             lines.append('⚠️ ' + clean(item['caveats']))
+        if item.get('relaxed'):
+            # A near-miss: say exactly which preference it does not meet.
+            lines.append('↔ ' + clean(item['relaxed']))
         lines.append('🔗 ' + ' '.join(links) if links else '🔗 —')
         cards.append('\n'.join(lines))
     head = clean(value['intro'])

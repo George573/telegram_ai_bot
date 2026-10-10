@@ -4,7 +4,8 @@ from pathlib import Path
 
 SKILLS_DIR = Path(__file__).parent / 'skills'
 # Fixed allowlist: the model can never name a path.
-SKILL_NAMES = ('nearby-places', 'city-events')
+SKILL_NAMES = ('nearby-places', 'city-events', 'evening-plan', 'date-ideas', 'kids-and-family',
+               'art-galleries', 'group-compromise')
 LOAD_SKILL = {
     'name': 'load_skill',
     'description': 'Load the full instructions for an available skill when its description matches the task.',
