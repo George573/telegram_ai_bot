@@ -3,6 +3,7 @@
 POST /v1/yandex-reviews {"url": "<Maps card>"} -> review sample or explicit unavailable status.
 POST /v1/afisha-listing {"category", "date_from", "days"} -> Moscow Afisha events.
 POST /v1/afisha-event {"url": "<Afisha event page>"} -> event details and sessions.
+POST /v1/yandex-maps-search {"query", "exclude_chains"} -> Moscow organizations from Maps search.
 GET /healthz -> {"status": "ok"}.
 """
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -16,6 +17,8 @@ from yandex_reviews import card_url, unavailable
 from review_browser import read_reviews
 import yandex_afisha
 from afisha_browser import read_event, read_listing
+import yandex_maps
+from maps_search import read_search
 
 MAX_BODY = 2048
 # One Chromium at a time keeps the container inside its memory limit.
@@ -75,7 +78,22 @@ def afisha_event(body):
     return _browse('afisha_event_read', url, read_event, yandex_afisha.unavailable)
 
 
-ROUTES = {'/v1/yandex-reviews': reviews, '/v1/afisha-listing': afisha_listing, '/v1/afisha-event': afisha_event}
+def maps_search(body):
+    try:
+        request = _request(body, {'query', 'exclude_chains'})
+        if type(request['exclude_chains']) is not bool:
+            raise ValueError
+        url = yandex_maps.search_url(request['query'])
+    except (ValueError, TypeError):
+        return 400, yandex_maps.unavailable(None, 'invalid_arguments')
+    # Same single slot as the browsers: one outbound Yandex request at a time.
+    return _browse('maps_search_read', request['query'],
+                   lambda query: read_search(query, request['exclude_chains']),
+                   lambda _query, reason: yandex_maps.unavailable(url, reason))
+
+
+ROUTES = {'/v1/yandex-reviews': reviews, '/v1/afisha-listing': afisha_listing, '/v1/afisha-event': afisha_event,
+          '/v1/yandex-maps-search': maps_search}
 
 
 class Handler(BaseHTTPRequestHandler):

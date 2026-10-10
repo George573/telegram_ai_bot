@@ -32,12 +32,13 @@ EVENTS = frozenset({
     'worker_failed', 'job_failed', 'update_failed', 'budget_overrun', 'command_throttled',
     'afisha_read_started', 'afisha_read_completed', 'afisha_read_failed', 'recommendations_rendered',
     'reply_finished', 'reply_fallback',
+    'maps_search_read_started', 'maps_search_read_completed', 'maps_search_read_failed',
 })
 NUMBERS = frozenset({'duration_ms', 'input_tokens', 'output_tokens', 'search_calls',
                      'update_id', 'status_code', 'retry_after', 'attempt', 'delay_ms', 'error_position',
                      'error_line', 'error_column', 'output_chars', 'repair_attempt', 'max_repairs', 'query_chars', 'result_count',
                      'tool_call_count', 'argument_chars', 'returned_chars', 'model_rounds', 'review_count',
-                     'failure_count', 'dropped_links', 'reasoning_tokens', 'model_requests', 'failed_requests',
+                     'failure_count', 'dropped_links', 'dropped_items', 'reasoning_tokens', 'model_requests', 'failed_requests',
                      'searches', 'reader_calls', 'reader_ok', 'skills_loaded', 'json_repairs'})
 AMOUNTS = frozenset({'reserved_usd', 'charged_usd', 'budget_usd', 'spent_usd'})
 OUTCOMES = frozenset({'delivered', 'silent', 'fallback_delivered', 'paused', 'not_directed', 'rate_limited',
@@ -53,12 +54,13 @@ ENUMS = {'parser_error': frozenset({'expected_value', 'extra_data', 'expected_ke
          'missing_fields', 'extra_fields', 'wrong_types', 'reply_required',
          'silent_reply_nonempty', 'reply_too_long', 'invalid_settings', 'wrong_types', 'too_long'}),
          'schema_name': frozenset({'reply_decision', 'character_settings', 'place_recommendations'}),
-         'search_site': frozenset({'afisha.yandex.ru', 'yandex.ru/maps'}),
+         'search_site': frozenset({'afisha.yandex.ru', 'yandex.ru/maps', 'restoclub.ru', 'afisha.ru',
+                                   'daily.afisha.ru', 't-j.ru'}),
          'search_recency': frozenset({'day', 'week', 'month', 'year'}),
          'format_mode': frozenset({'json_schema', 'json_object'}),
          'json_repair_mode': frozenset({'format_only'}),
          'requested_tool': frozenset({'load_skill', 'search_web', 'web_search', 'read_yandex_reviews',
-                                     'read_afisha_listing', 'read_afisha_event', 'other'}),
+                                     'read_afisha_listing', 'read_afisha_event', 'read_yandex_maps_search', 'other'}),
          'tool_error': frozenset({'tools_disabled', 'step_limit', 'multiple_calls', 'unknown_tool',
                                 'missing_call_id', 'argument_type', 'arguments_too_long',
                                 'malformed_arguments', 'invalid_arguments', 'repeated_skill_limit',
@@ -79,7 +81,8 @@ ENUMS = {'parser_error': frozenset({'expected_value', 'extra_data', 'expected_ke
                               'not_found', 'access_denied', 'redirected', 'reviews_not_loaded', 'no_review_texts',
                               'busy', 'invalid_url', 'context_budget', 'too_many_calls', 'review_limit',
                               'unexpected_error', 'retry_scheduled', 'gave_up', 'invalid_arguments', 'no_events',
-                              'event_not_loaded', 'search_limit'})}
+                              'event_not_loaded', 'search_limit', 'no_results', 'page_changed', 'too_large',
+                              'timeout_or_network'})}
 
 VALIDATION_DETAILS = {
     'malformed_json': 'Ответ не удалось разобрать как JSON.',
@@ -162,7 +165,8 @@ class JobStats:
         elif name == 'web_search_completed' or (name == 'web_search_failed' and fields.get('reason') == 'request_failed'):
             self.searches += 1
             self.spent += amount if amount is not None else (fields.get('reserved_usd') or Decimal('0'))
-        elif name in {'reviews_read_completed', 'reviews_read_failed', 'afisha_read_completed', 'afisha_read_failed'} \
+        elif name in {'reviews_read_completed', 'reviews_read_failed', 'afisha_read_completed', 'afisha_read_failed',
+                      'maps_search_read_completed', 'maps_search_read_failed'} \
                 and 'review_count' in fields:
             self.reader_calls += 1
             self.reader_ok += name.endswith('_completed')

@@ -11,6 +11,7 @@ from urllib.parse import urlsplit
 from openai import OpenAI, BadRequestError
 from skill_registry import LOAD_SKILL
 from yandex_afisha import READ_AFISHA_EVENT, READ_AFISHA_LISTING
+from yandex_maps import READ_YANDEX_MAPS_SEARCH
 from yandex_reviews import READ_YANDEX_REVIEWS
 
 PRICES = {
@@ -33,19 +34,22 @@ VOICE_MAX_SECONDS = {'openai': 300, 'zai': 30}
 TRANSCRIPTION_RATES = {'openai': Decimal('0.0045'), 'zai': Decimal('0.0024')}
 IMAGE_MAX_BYTES = {'openai': 10 * 1024 * 1024, 'zai': 5 * 1024 * 1024}
 WEB_CALL_COST = Decimal('0.01')
-SEARCH_SITES = ('afisha.yandex.ru', 'yandex.ru/maps')
+# Editorial Moscow food/culture sources plus Yandex services; robots.txt allows their articles and listings.
+SEARCH_SITES = ('afisha.yandex.ru', 'yandex.ru/maps', 'restoclub.ru', 'afisha.ru', 'daily.afisha.ru', 't-j.ru')
 SEARCH_RECENCY = ('day', 'week', 'month', 'year')
 SEARCH_WEB = {'name': 'search_web',
     'description': 'Search the public web now and return titles, URLs and evidence snippets. Use it for current '
                    'places, events and factual lookups; never ask the user to run /search. site restricts results '
-                   '(afisha.yandex.ru for events, yandex.ru/maps for organization cards) or null for the whole web; '
+                   '(afisha.yandex.ru for events; restoclub.ru, afisha.ru, daily.afisha.ru, t-j.ru for editorial '
+                   'guides and reviews; yandex.ru/maps only as a last resort, prefer read_yandex_maps_search) '
+                   'or null for the whole web; '
                    'recency limits results to the last day/week/month/year, or null.',
     'parameters': {'type': 'object', 'properties': {
         'query': {'type': 'string', 'maxLength': 400},
         'site': {'type': ['string', 'null'], 'enum': [*SEARCH_SITES, None]},
         'recency': {'type': ['string', 'null'], 'enum': [*SEARCH_RECENCY, None]}},
         'required': ['query', 'site', 'recency'], 'additionalProperties': False}}
-READERS = (READ_YANDEX_REVIEWS, READ_AFISHA_LISTING, READ_AFISHA_EVENT)
+READERS = (READ_YANDEX_MAPS_SEARCH, READ_YANDEX_REVIEWS, READ_AFISHA_LISTING, READ_AFISHA_EVENT)
 # Search requests leave the bot with a fixed location hint, never user data.
 SEARCH_LOCATION = {'type': 'approximate', 'country': 'RU', 'city': 'Moscow', 'timezone': 'Europe/Moscow'}
 # Models whose reasoning shares max_tokens with the visible answer, and the extra room they get.

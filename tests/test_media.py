@@ -197,8 +197,8 @@ class SearchAndMediaModelTests(unittest.TestCase):
             return SimpleNamespace(status='completed', output_text='Hello', usage=None, output=[])
         self.model(create).generate('Cat', [{'role': 'user', 'content': 'Latest news?'}], allow_search=True)
         tools = params[0]['tools']
-        self.assertEqual([tool['name'] for tool in tools], ['load_skill', 'search_web', 'read_yandex_reviews',
-                                                            'read_afisha_listing', 'read_afisha_event'])
+        self.assertEqual([tool['name'] for tool in tools], ['load_skill', 'search_web', 'read_yandex_maps_search',
+                                                            'read_yandex_reviews', 'read_afisha_listing', 'read_afisha_event'])
         self.assertTrue(all(tool['type'] == 'function' and tool['strict'] for tool in tools))
         self.assertNotIn('maxLength', json.dumps(tools))
     def test_search_disabled_no_tool_fee_and_silent_decisions_not_sent(self):

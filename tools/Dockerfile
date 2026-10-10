@@ -5,7 +5,7 @@ WORKDIR /app
 COPY tools/requirements.lock .
 RUN apt-get update && apt-get install -y --no-install-recommends chromium && rm -rf /var/lib/apt/lists/*
 RUN pip install --no-cache-dir --require-hashes -r requirements.lock && useradd --uid 10002 --no-create-home tools
-COPY src/yandex_reviews.py src/yandex_afisha.py tools/browser.py tools/review_browser.py tools/afisha_browser.py tools/server.py ./
+COPY src/yandex_reviews.py src/yandex_afisha.py src/yandex_maps.py tools/browser.py tools/review_browser.py tools/afisha_browser.py tools/maps_search.py tools/server.py ./
 COPY src/licenses ./licenses
 USER 10002
 EXPOSE 8080

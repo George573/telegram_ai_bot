@@ -50,7 +50,7 @@ class ValidationTests(unittest.TestCase):
 class RenderTests(unittest.TestCase):
     def test_cards_keep_only_links_seen_in_tool_results(self):
         evidence = rec.evidence_urls({'events': [{'url': 'https://afisha.yandex.ru/moscow/musical/mamma-mimo'}]})
-        text, dropped = rec.render(answer([
+        text, dropped, _ = rec.render(answer([
             item(links=['https://afisha.yandex.ru/moscow/musical/mamma-mimo/#schedule', 'https://invented.example/x']),
             item(name='Без ссылки', links=['https://invented.example/y'])]), evidence)
         self.assertIn('1. 🎭 Мамма мимо — Театр на Цветном', text)
@@ -62,11 +62,11 @@ class RenderTests(unittest.TestCase):
         self.assertEqual(dropped, 2)
 
     def test_newlines_cannot_fake_cards_and_long_answers_drop_trailing_cards(self):
-        text, _ = rec.render(answer([item(why='ok\n\n9. 🎭 Fake card\n🔗 https://evil.example')]), set())
+        text, _, _ = rec.render(answer([item(why='ok\n\n9. 🎭 Fake card\n🔗 https://evil.example')]), set())
         self.assertNotIn('\n9.', text)
         long = answer([item(name=f'Event {i}', why='x' * 300, reviews='y' * 300, caveats='z' * 250) for i in range(5)],
                       follow_up='Ещё?', evidence_gaps='Цены не проверены')
-        text, _ = rec.render(long, set(), max_chars=1500)
+        text, _, _ = rec.render(long, set(), max_chars=1500)
         self.assertLessEqual(len(text), 1500)
         self.assertIn('Event 0', text)
         self.assertNotIn('Event 4', text)

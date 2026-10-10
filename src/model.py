@@ -18,10 +18,11 @@ from storage import BudgetExceeded
 from skill_registry import catalog as skill_catalog, instructions as skill_instructions, SKILL_NAMES
 from yandex_reviews import card_url
 import yandex_afisha
+import yandex_maps
 import recommendations
 from recommendations import evidence_urls
 from providers import SEARCH_SITES, SEARCH_RECENCY
-from tool_client import read_afisha_event, read_afisha_listing, read_reviews
+from tool_client import read_afisha_event, read_afisha_listing, read_maps_search, read_reviews
 
 # Backward-compatible alias for callers using the OpenAI price catalog.
 PRICES = PROVIDER_PRICES['openai']
@@ -35,12 +36,15 @@ LAST_STEP = ('\nThis is your last research step. After these tool results you mu
 # Moscow has used UTC+3 without DST since 2014; avoids depending on tzdata in slim images.
 MOSCOW = timezone(timedelta(hours=3), 'Europe/Moscow')
 SEARCH_INPUT_TOKENS = 20000
-READER_LIMITS = {'read_yandex_reviews': MAX_REVIEW_READS, 'read_afisha_listing': 2, 'read_afisha_event': 3}
-READER_KEYS = {'read_yandex_reviews': {'url'}, 'read_afisha_event': {'url'},
-               'read_afisha_listing': {'category', 'date_from', 'days'}}
-READER_TITLES = {'read_yandex_reviews': 'Яндекс Карты: отзывы', 'read_afisha_listing': 'Яндекс Афиша',
-                 'read_afisha_event': 'Яндекс Афиша: событие'}
+READER_LIMITS = {'read_yandex_maps_search': 3, 'read_yandex_reviews': MAX_REVIEW_READS,
+                 'read_afisha_listing': 2, 'read_afisha_event': 3}
+READER_KEYS = {'read_yandex_maps_search': {'query', 'exclude_chains'}, 'read_yandex_reviews': {'url'},
+               'read_afisha_event': {'url'}, 'read_afisha_listing': {'category', 'date_from', 'days'}}
+READER_TITLES = {'read_yandex_maps_search': 'Яндекс Карты: поиск', 'read_yandex_reviews': 'Яндекс Карты: отзывы',
+                 'read_afisha_listing': 'Яндекс Афиша', 'read_afisha_event': 'Яндекс Афиша: событие'}
 READER_HINTS = {
+    'read_yandex_maps_search': 'Invalid Maps search. Use a short plain query such as "кофейня Никольская" '
+        '(category plus street, district or metro), no links, and exclude_chains true or false.',
     'read_yandex_reviews': 'Not an organization card. Pass the full card URL, for example '
         'https://yandex.ru/maps/org/<name>/<id>/. Short /maps/-/ links are not supported. '
         'Reviews were not read; do not invent a rating or review analysis.',
@@ -48,6 +52,8 @@ READER_HINTS = {
         'https://afisha.yandex.ru/moscow/<type>/<slug> taken from read_afisha_listing or search results.',
     'read_afisha_listing': 'Invalid listing request. Use a known category, date_from as YYYY-MM-DD from today '
         'onward and days from 1 to 7.'}
+READ_EVENTS = {'read_yandex_maps_search': 'maps_search_read', 'read_yandex_reviews': 'reviews_read',
+               'read_afisha_listing': 'afisha_read', 'read_afisha_event': 'afisha_read'}
 TOOL_NAMES = frozenset({'load_skill', 'search_web'} | set(READER_LIMITS))
 
 
@@ -262,8 +268,10 @@ class Model:
                 'If search fails or finds no usable evidence, say so rather than inventing results. '
                 'There is no later step: never promise to search again, try more queries or report back in a '
                 'later message. Give the best answer now from the evidence, or say plainly what could not be found. '
-                'For venue finalists, use read_yandex_reviews with the exact Maps organization card URL; for Moscow '
-                'theatre, concerts, exhibitions and other events use read_afisha_listing and read_afisha_event. '
+                'For Moscow venues, find candidates with read_yandex_maps_search (set exclude_chains when the user '
+                'wants non-chain places) and read finalists with read_yandex_reviews using the returned card URL; '
+                'for Moscow theatre, concerts, exhibitions and other events use read_afisha_listing and '
+                'read_afisha_event. Requirements the user states are hard filters, not ranking hints. '
                 'Do not tell the user something cannot be checked without trying the tool. An unavailable result '
                 'is not evidence; disclose the limitation honestly.')
             instructions += ('\nWhen verifying a previously named place, search its exact name plus address '
@@ -277,6 +285,7 @@ class Model:
         continuation = ()
         sources = []
         evidence = set()
+        excluded_names = set()
         loaded_skills = {}
         search_confirmed = False
         reader_confirmed = False
@@ -307,6 +316,8 @@ class Model:
         def remember(result):
             nonlocal reader_confirmed
             evidence.update(evidence_urls(result))
+            # Chains removed at the user's request may never come back as cards.
+            excluded_names.update(n for n in result.get('excluded_chains') or [] if isinstance(n, str))
             reader_confirmed = reader_confirmed or result.get('status') == 'ok'
         while pending_calls or model_round < 5:
             if budget_exhausted and not pending_calls:
@@ -352,7 +363,8 @@ class Model:
                         'The tools are available. Do not send the user to /search.')
                     continue
                 return self._finish(response.text, instructions, history, output_tokens, image, continuation,
-                                    sources, evidence, max_chars, response_format, result_format)
+                                    sources, evidence, max_chars, response_format, result_format,
+                                excluded_names=excluded_names)
             # Process validated calls; extra calls in a batch get a short rejection.
             # No model-controlled paths, shell commands, or arbitrary tools.
             if not allow_search:
@@ -475,21 +487,22 @@ class Model:
         event('ai_final_answer_completed', provider=self.config.provider, model=self.config.model,
               output_chars=len(response.text), duration_ms=int((time.monotonic() - started) * 1000))
         return self._finish(response.text, final_instructions, history, output_tokens, image, continuation,
-                            sources, evidence, max_chars, response_format, result_format)
+                            sources, evidence, max_chars, response_format, result_format,
+                                excluded_names=excluded_names)
 
     def _finish(self, text, instructions, history, output_tokens, image, continuation, sources, evidence,
-                max_chars, response_format, result_format):
+                max_chars, response_format, result_format, excluded_names=()):
         text = text.strip()
         if result_format is recommendations.FORMAT and response_format is None:
             return self._render_recommendations(text, instructions, history, output_tokens, image,
-                                                continuation, sources, evidence, max_chars)
+                                                continuation, sources, evidence, max_chars, excluded_names)
         if response_format:
             return ModelText(text[:max_chars] if max_chars else text, sources[:3])
         sources = cited_sources(text, sources)
         return with_sources(text, sources[:3], max_chars) if max_chars else ModelText(text, sources[:3])
 
     def _render_recommendations(self, raw, instructions, history, output_tokens, image, continuation,
-                                sources, evidence, max_chars):
+                                sources, evidence, max_chars, excluded_names=()):
         """Validate the card JSON with up to two format-only repairs, then render grounded cards."""
         fields = {'provider': self.config.provider, 'model': self.config.model, 'json_request_id': uuid4().hex,
                   'schema_name': recommendations.NAME,
@@ -521,8 +534,9 @@ class Model:
                     'add facts. Return the corrected place_recommendations JSON object only.',
                     history, output_tokens, recommendations.FORMAT, False, image, False,
                     skill_enabled=False, continuation=repair).text.strip()
-        text, dropped = recommendations.render(value, evidence, max_chars or 3500)
-        event('recommendations_rendered', **fields, result_count=len(value['items']), dropped_links=dropped)
+        text, dropped, removed = recommendations.render(value, evidence, max_chars or 3500, excluded_names)
+        event('recommendations_rendered', **fields, result_count=len(value['items']) - removed,
+              dropped_links=dropped, dropped_items=removed)
         return ModelText(text, sources[:3])
 
     def _tool_batch_error(self, calls, allow_search):
@@ -573,6 +587,10 @@ class Model:
         try:
             if name == 'read_yandex_reviews':
                 target = card_url(arguments['url'])
+            elif name == 'read_yandex_maps_search':
+                if type(arguments['exclude_chains']) is not bool:
+                    raise ValueError('exclude_chains must be boolean')
+                target = (yandex_maps.search_url(arguments['query']), arguments['exclude_chains'])
             elif name == 'read_afisha_event':
                 target = yandex_afisha.event_url(arguments['url'])
             else:
@@ -580,7 +598,7 @@ class Model:
                                                    today=datetime.now(MOSCOW).date())
         except (ValueError, TypeError):
             # A plausible but unsupported target is the model's mistake, not a protocol error.
-            event('reviews_read_failed' if name == 'read_yandex_reviews' else 'afisha_read_failed',
+            event(READ_EVENTS[name] + '_failed',
                   level=logging.WARNING, provider=self.config.provider, model=self.config.model, requested_tool=name,
                   reason='invalid_url' if 'url' in arguments else 'invalid_arguments', tool_error='invalid_url'
                   if 'url' in arguments else 'invalid_arguments', argument_chars=len(call.arguments), tool_call_count=1)
@@ -589,7 +607,7 @@ class Model:
         if (name, target) in results:
             result = results[name, target]
         elif counts.get(name, 0) >= READER_LIMITS[name]:
-            event('reviews_read_failed' if name == 'read_yandex_reviews' else 'afisha_read_failed',
+            event(READ_EVENTS[name] + '_failed',
                   level=logging.WARNING, provider=self.config.provider, model=self.config.model,
                   requested_tool=name, reason='review_limit', tool_error='review_limit', tool_call_count=1)
             return json.dumps({'status': 'unavailable', 'reason': 'review_limit', 'notice':
@@ -598,18 +616,21 @@ class Model:
             counts[name] = counts.get(name, 0) + 1
             result = results[name, target] = self._read_tool(name, target, arguments)
         remember(result)
-        if result.get('status') == 'ok' and target not in [source[1] for source in sources]:
-            sources.append((READER_TITLES[name], target))
+        page = target[0] if isinstance(target, tuple) else target
+        if result.get('status') == 'ok' and name != 'read_yandex_maps_search' and page not in [s[1] for s in sources]:
+            sources.append((READER_TITLES[name], page))
         return json.dumps(result, ensure_ascii=False)
 
     def _read_tool(self, name, target, arguments):
         fields = {'provider': self.config.provider, 'model': self.config.model,
                   'reviews_request_id': uuid4().hex, 'requested_tool': name}
-        prefix = 'reviews_read' if name == 'read_yandex_reviews' else 'afisha_read'
+        prefix = READ_EVENTS[name]
         started = time.monotonic()
         event(prefix + '_started', **fields)
         if name == 'read_yandex_reviews':
             call = lambda: read_reviews(target, self.config.tools_url)
+        elif name == 'read_yandex_maps_search':
+            call = lambda: read_maps_search(arguments['query'], arguments['exclude_chains'], self.config.tools_url)
         elif name == 'read_afisha_event':
             call = lambda: read_afisha_event(target, self.config.tools_url)
         else:

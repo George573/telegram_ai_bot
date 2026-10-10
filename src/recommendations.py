@@ -137,11 +137,25 @@ def clean(text):
     return re.sub(r'\s+', ' ', text).strip() if text else ''
 
 
-def render(value, evidence, max_chars=3500):
-    """Plain-text Telegram cards; returns (text, dropped_link_count)."""
+def name_key(name):
+    return re.sub(r'[^\w]+', ' ', (name or '').casefold()).strip()
+
+
+def render(value, evidence, max_chars=3500, excluded_names=()):
+    """Plain-text Telegram cards; returns (text, dropped_link_count, dropped_item_count).
+
+    Items naming a chain that a tool excluded at the user's request are removed entirely.
+    """
     dropped = 0
+    excluded = {name_key(name) for name in excluded_names if name_key(name)}
+    def is_excluded(name):
+        key = name_key(name)
+        # Same name, or a branded variant of it ("Surf Coffee x Boom").
+        return any(key == chain or key.startswith(chain + ' ') for chain in excluded)
+    items = [item for item in value['items'] if not is_excluded(item['name'])]
+    removed = len(value['items']) - len(items)
     cards = []
-    for index, item in enumerate(value['items'], 1):
+    for index, item in enumerate(items, 1):
         links = []
         for link in item['links']:
             url = canonical(link)
@@ -174,5 +188,5 @@ def render(value, evidence, max_chars=3500):
     while True:
         text = '\n\n'.join([head] + cards + tail)
         if len(text) <= max_chars or not cards:
-            return text[:max_chars], dropped
+            return text[:max_chars], dropped, removed
         cards.pop()

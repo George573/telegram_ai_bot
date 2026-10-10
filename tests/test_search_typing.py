@@ -310,7 +310,7 @@ class SearchTests(unittest.TestCase):
             body = json.loads(request.content)
             self.assertEqual({tool['type'] for tool in body['tools']}, {'function'})
             names = [tool['function']['name'] for tool in body['tools']]
-            self.assertEqual(names, ['load_skill', 'search_web', 'read_yandex_reviews',
+            self.assertEqual(names, ['load_skill', 'search_web', 'read_yandex_maps_search', 'read_yandex_reviews',
                                      'read_afisha_listing', 'read_afisha_event'])
             return self.response()
         self.assertEqual(self.model(handler).generate('Cat', [], allow_search=True), 'Hello')

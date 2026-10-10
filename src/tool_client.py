@@ -2,6 +2,7 @@
 import httpx
 from yandex_reviews import card_url, unavailable
 import yandex_afisha
+import yandex_maps
 
 # Server waits up to 25 s for the browser slot, then reads for up to 45 s.
 TIMEOUT = httpx.Timeout(80, connect=3)
@@ -9,6 +10,8 @@ RESULT_KEYS = {'status', 'reason', 'url', 'fetched_at', 'company', 'reviews', 'r
 LISTING_KEYS = {'status', 'reason', 'url', 'fetched_at', 'city', 'events', 'returned_count', 'sampling', 'notice'}
 EVENT_KEYS = {'status', 'reason', 'url', 'fetched_at', 'name', 'kind', 'labels', 'age', 'description', 'venue',
               'run', 'duration', 'price', 'rating', 'sessions', 'returned_count', 'notice', 'events'}
+MAPS_KEYS = {'status', 'reason', 'url', 'fetched_at', 'results', 'returned_count', 'chains_excluded',
+             'excluded_chains', 'sampling', 'notice'}
 
 
 def _post(base_url, path, body, url, keys, items, missing):
@@ -47,3 +50,9 @@ def read_afisha_listing(category, date_from, days, base_url):
 def read_afisha_event(value, base_url):
     url = yandex_afisha.event_url(value)
     return _post(base_url, '/v1/afisha-event', {'url': url}, url, EVENT_KEYS, 'sessions', yandex_afisha.unavailable)
+
+
+def read_maps_search(query, exclude_chains, base_url):
+    url = yandex_maps.search_url(query)
+    return _post(base_url, '/v1/yandex-maps-search', {'query': query, 'exclude_chains': exclude_chains},
+                 url, MAPS_KEYS, 'results', yandex_maps.unavailable)
