@@ -6,6 +6,7 @@ POST /v1/afisha-event {"url": "<Afisha event page>"} -> event details and sessio
 GET /healthz -> {"status": "ok"}.
 """
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from datetime import datetime, timezone
 import json
 import os
 import sys
@@ -22,20 +23,22 @@ BROWSER_SLOTS = threading.BoundedSemaphore(1)
 BUSY_WAIT_SECONDS = 25
 
 
-def log(name, **fields):
-    # Fixed metadata only: never URLs, page text or exception messages.
-    print(json.dumps({'event': name, **fields}), file=sys.stdout, flush=True)
+def log(name, level='INFO', **fields):
+    # Same shape as the bot's JSON logs. Fixed metadata only: never URLs, page text or exception messages.
+    record = {'time': datetime.now(timezone.utc).isoformat(), 'level': level, 'service': 'tools', 'event': name}
+    print(json.dumps({**record, **{k: v for k, v in fields.items() if v is not None}}), file=sys.stdout, flush=True)
 
 
 def _browse(name, url, reader, busy):
     if not BROWSER_SLOTS.acquire(timeout=BUSY_WAIT_SECONDS):
+        log(name, 'WARNING', status='unavailable', reason='busy')
         return 200, busy(url, 'busy')
     started = time.monotonic()
     try:
         result = reader(url)
     finally:
         BROWSER_SLOTS.release()
-    log(name, status=result['status'], reason=result.get('reason'),
+    log(name, 'INFO' if result['status'] == 'ok' else 'WARNING', status=result['status'], reason=result.get('reason'),
         returned_count=result['returned_count'], duration_ms=int((time.monotonic() - started) * 1000))
     return 200, result
 
@@ -111,7 +114,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             self.reply(*handler(self.rfile.read(length)))
         except Exception:
-            log('tool_failed', path=self.path)
+            log('tool_failed', 'ERROR', path=self.path)
             self.reply(500, {'status': 'unavailable', 'reason': 'tool_failed', 'reviews': [], 'returned_count': 0})
 
 
