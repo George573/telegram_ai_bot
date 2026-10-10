@@ -1,6 +1,6 @@
 from contextlib import nullcontext
 import logging
-from observability import event
+from observability import event, fallback, job_context, job_finished
 from providers import CAPABILITIES, VOICE_MAX_SECONDS, IMAGE_MAX_BYTES
 from media import MediaFailure, voice_wav
 from personality import named, instructions, settings, DEFAULTS, validate, describe
@@ -184,6 +184,11 @@ class Service:
                 return
         self.store.enqueue(update_id, payload)
 
+    def finish(self, job, outcome):
+        """Drop the job and log its one-line summary."""
+        self.store.finish(job['update_id'])
+        job_finished(job['update_id'], outcome, directed=bool(job.get('payload', {}).get('directed')))
+
     def queue_answer(self, job, text, assistant=False):
         self.store.phase(job['update_id'], 'generated', text, assistant)
 
@@ -218,7 +223,7 @@ class Service:
         chat_id, command, argument = payload['chat_id'], payload['command'], payload['argument'].strip()
         if command in {'/help', '/whoami', '/forgetme', '/status'} and self.throttled(
                 payload, 'commands', FREE_COMMANDS_PER_MINUTE, 60):
-            self.store.finish(job['update_id'])
+            self.finish(job, 'throttled')
             return
         if command == '/forgetme':
             if payload['anonymous'] or not payload.get('user_id'):
@@ -300,6 +305,7 @@ class Service:
             self.queue_answer(job, str(error))
         except (ModelFailure, BudgetExceeded):
             event('settings_failed', level=logging.WARNING, update_id=job['update_id'])
+            fallback('settings_failed')
             self.queue_answer(job, 'AI settings or memory operation could not complete. Saved settings and memory were retained; check /status and try again.')
 
     def convert_media(self, job):
@@ -337,9 +343,10 @@ class Service:
         except (MediaFailure, TelegramFailure, ModelFailure, BudgetExceeded):
             event('media_failed', level=logging.WARNING, update_id=job['update_id'], reason='processing_failed')
             if payload['directed']:
+                fallback('media_failed')
                 self.queue_answer(job, 'I could not process that media. Check /status, size/duration limits and try again.')
             else:
-                self.store.finish(job['update_id'])
+                self.finish(job, 'media_failed')
 
     def prepare(self, job):
         payload = job['payload']
@@ -352,16 +359,16 @@ class Service:
             paid = payload['argument'].strip().casefold() not in {'', 'save', 'yes', 'да', 'сохранить', 'cancel', 'отмена', 'нет', 'show', 'reset'}
         if not payload['command'] and (state['paused'] or (state['mode'] == 'directed' and not payload['directed'])):
             # Ignored turns must not consume the group's request allowance.
-            self.store.finish(job['update_id'])
+            self.finish(job, 'paused' if state['paused'] else 'not_directed')
             return
         admit = getattr(self.store, 'admit', None)
         if paid and admit and not admit(job, self.config.user_requests_per_minute, self.config.chat_requests_per_minute, self.config.user_media_per_minute):
-            self.store.finish(job['update_id'])
+            self.finish(job, 'rate_limited')
             return
         if payload.get('media'):
             media_field = 'images_enabled' if payload['media']['kind'] == 'photo' else 'voice_enabled'
             if state['paused'] or not state.get(media_field, True) or (state['mode'] == 'directed' and not payload['directed']):
-                self.store.finish(job['update_id'])
+                self.finish(job, 'paused' if state['paused'] else 'media_disabled' if not state.get(media_field, True) else 'not_directed')
             else:
                 self.convert_media(job)
             return
@@ -369,13 +376,15 @@ class Service:
             self.command(job)
             return
         if state['paused'] or (state['mode'] == 'directed' and not payload['directed']):
-            self.store.finish(job['update_id'])
+            self.finish(job, 'paused' if state['paused'] else 'not_directed')
             return
         if payload['command'] == '/search':
             query = payload['argument'].strip()
             if not state.get('web_enabled', False) or not self.feature_available('web'):
+                fallback('search_disabled')
                 self.queue_answer(job, 'Search is disabled. A settings manager can enable /web on.')
             elif not query or len(query) > 400:
+                fallback('invalid_request')
                 self.queue_answer(job, 'Use /search followed by a public query of 1–400 characters. Do not include private information.')
             else:
                 try:
@@ -386,6 +395,7 @@ class Service:
                             [{'role': 'user', 'content': query}], allow_search=True, require_search=True)
                     self.queue_answer(job, answer)
                 except (ModelFailure, BudgetExceeded):
+                    fallback('search_failed')
                     self.queue_answer(job, 'Search could not complete. Check /status and try later.')
             return
         cooling = not payload['directed'] and self.store.cooling_down(chat_id, self.config.cooldown)
@@ -396,15 +406,16 @@ class Service:
                 self.store.append(chat_id, 'user', content, sender_id=payload.get('user_id'), message_id=payload['message_id'])
                 if cooling:
                     # Keep all-mode context even when suppressing incidental replies.
-                    self.store.finish(job['update_id'])
+                    self.finish(job, 'cooldown')
                 else:
                     self.store.phase(job['update_id'], 'prepared')
         except (BudgetExceeded, ModelFailure):
             event('memory_failed', level=logging.WARNING, update_id=job['update_id'])
             if payload['directed']:
+                fallback('memory')
                 self.queue_answer(job, 'I cannot process more context right now. Memory was retained; check /status.')
             else:
-                self.store.finish(job['update_id'])
+                self.finish(job, 'memory_failed')
 
     def generate(self, job):
         with self.waiting(job['payload']):
@@ -414,7 +425,7 @@ class Service:
         payload = job['payload']
         state = self.store.state(payload['chat_id'])
         if state['paused']:
-            self.store.finish(job['update_id'])
+            self.finish(job, 'paused')
             return
         history = [{'role': r['role'], 'content': r['content']} for r in self.store.messages(payload['chat_id'])]
         if state['summary']:
@@ -448,27 +459,29 @@ class Service:
                                                  + persona, history, allow_search=True)
             event('reply_generated', update_id=job['update_id'], responded=answer is not None)
             if self.store.state(payload['chat_id'])['paused']:
-                self.store.finish(job['update_id'])
+                self.finish(job, 'paused')
                 return
             with self.store.transaction():
                 if answer is None:
-                    self.store.finish(job['update_id'])
+                    self.finish(job, 'silent')
                 else:
                     self.queue_answer(job, answer, assistant=True)
         except BudgetExceeded:
             if not payload['directed']:
-                self.store.finish(job['update_id'])
+                self.finish(job, 'budget_exceeded')
                 return
+            fallback('budget')
             self.queue_answer(job, 'My configured spending allowance is exhausted. An owner must change it before AI replies resume.')
         except ModelFailure:
             if not payload['directed']:
-                self.store.finish(job['update_id'])
+                self.finish(job, 'model_failed')
                 return
+            fallback('model_failure')
             self.queue_answer(job, 'I could not complete that reply. Please try again later.')
 
     def deliver(self, job):
         if job['assistant'] and self.store.state(job['payload']['chat_id'])['paused']:
-            self.store.finish(job['update_id'])
+            self.finish(job, 'paused')
             return 0
         # Mark before sending: after a crash, an uncertain send is NOT retried.
         self.store.phase(job['update_id'], 'sending', job['answer'], job['assistant'])
@@ -481,7 +494,7 @@ class Service:
                 # Explicit rate-limit rejection or a failed connection means Telegram did not accept the message.
                 self.store.retry_delivery(job, max(1, error.retry_after or 5 * (job.get('delivery_attempts', 0) + 1)))
                 return 0
-            self.store.finish(job['update_id'])
+            self.finish(job, 'delivery_failed')
             return 0
         event('reply_delivered', update_id=job['update_id'])
         with self.store.transaction():
@@ -489,7 +502,7 @@ class Service:
                 self.store.append(job['payload']['chat_id'], 'assistant', job['answer'],
                                   message_id=delivered.get('message_id') if isinstance(delivered, dict) else None)
                 self.store.mark_reply(job['payload']['chat_id'])
-            self.store.finish(job['update_id'])
+            self.finish(job, 'delivered')
         return 0
 
     def process_one(self, chat_id=None):
@@ -505,7 +518,8 @@ class Service:
                 return None
             with scope(job['payload'].get('thread_id')) if scope else nullcontext(), spending(job['payload']['chat_id'], budget) if spending else nullcontext():
                 try:
-                    return self.process_job(job)
+                    with job_context(job['update_id']):
+                        return self.process_job(job)
                 except Exception:
                     # One bad job must not stop the bot or crash-loop it after restart.
                     self.job_failed(job)
@@ -518,17 +532,17 @@ class Service:
         event('job_failed', level=logging.ERROR, update_id=job['update_id'], phase=job['phase'],
               failure_count=failures, reason='gave_up' if gave_up else 'retry_scheduled')
         if gave_up:
-            self.store.finish(job['update_id'])
+            self.finish(job, 'gave_up')
 
     def process_job(self, job):
         if job['payload']['chat_id'] not in self.config.chats:
-            self.store.finish(job['update_id'])
+            self.finish(job, 'revoked')
             return 0
         event('job_processing', update_id=job['update_id'], phase=job['phase'])
         if job['phase'] == 'sending':
             event('delivery_unknown', level=logging.WARNING, update_id=job['update_id'])
             # Delivery unknown after restart: discard job, never invent a delivered reply.
-            self.store.finish(job['update_id'])
+            self.finish(job, 'delivery_unknown')
         elif job['phase'] == 'queued':
             self.prepare(job)
         elif job['phase'] == 'prepared':

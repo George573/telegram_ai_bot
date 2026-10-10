@@ -180,6 +180,13 @@ class Generation:
     continuation: tuple = ()
     finish_reason: str | None = None
     incomplete_reason: str | None = None
+    reasoning_tokens: int | None = None
+
+
+def reasoning_tokens(usage, details):
+    """Reasoning tokens from OpenAI-style usage details, or None when not reported."""
+    value = member(member(usage, details), 'reasoning_tokens') if usage is not None else None
+    return value if type(value) is int and value >= 0 else None
 
 
 @dataclass(frozen=True)
@@ -265,7 +272,8 @@ class OpenAIProvider:
         return Generation(response.output_text, response.status == 'completed',
             usage.input_tokens if usage else None, usage.output_tokens if usage else None,
             (), 0, Decimal('0'), tool_calls=calls, continuation=carried, finish_reason=response.status,
-            incomplete_reason=member(member(response, 'incomplete_details'), 'reason'))
+            incomplete_reason=member(member(response, 'incomplete_details'), 'reason'),
+            reasoning_tokens=reasoning_tokens(usage, 'output_tokens_details'))
 
     def search(self, query, site=None, recency=None, *, model):
         """One hosted web search in a small separate request; returns cited URLs with snippets."""
@@ -382,7 +390,8 @@ class ZaiProvider:
         return Generation(choice.message.content or '',
             choice.finish_reason == 'stop' or (choice.finish_reason == 'tool_calls' and bool(calls)),
             usage.prompt_tokens if usage else None, usage.completion_tokens if usage else None,
-            (), 0, Decimal('0'), calls, carried, finish_reason=choice.finish_reason)
+            (), 0, Decimal('0'), calls, carried, finish_reason=choice.finish_reason,
+            reasoning_tokens=reasoning_tokens(usage, 'completion_tokens_details'))
 
     def skill_result(self, call, text):
         return {'role': 'tool', 'tool_call_id': call.call_id, 'content': text}

@@ -701,7 +701,7 @@ class Model:
             event('ai_request_completed', provider=self.config.provider, model=request_model,
                   operation=operation, duration_ms=int((time.monotonic() - started) * 1000),
                   input_tokens=response.input_tokens, output_tokens=response.output_tokens,
-                  search_calls=response.search_calls, charged_usd=charged)
+                  reasoning_tokens=response.reasoning_tokens, search_calls=response.search_calls, charged_usd=charged)
             return response
         except BudgetExceeded:
             raise
@@ -713,6 +713,7 @@ class Model:
                   output_chars=len(response.text) if response else None,
                   input_tokens=response.input_tokens if response else None,
                   output_tokens=response.output_tokens if response else None,
+                  reasoning_tokens=response.reasoning_tokens if response else None,
                   duration_ms=int((time.monotonic() - started) * 1000))
             raise
         except Exception as error:

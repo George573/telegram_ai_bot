@@ -1,9 +1,14 @@
 """Allowlisted operational metadata; no skill text, user payloads or exceptions."""
+from collections import OrderedDict
+from contextlib import contextmanager
+import contextvars
 import hashlib
 import json
 import logging
 import re
 import sys
+import threading
+import time
 from datetime import datetime, timezone
 from decimal import Decimal
 from providers import PRICES, VISION_PRICES, ZAI_ERROR_CODES
@@ -26,13 +31,20 @@ EVENTS = frozenset({
     'reviews_read_started', 'reviews_read_completed', 'reviews_read_failed',
     'worker_failed', 'job_failed', 'update_failed', 'budget_overrun', 'command_throttled',
     'afisha_read_started', 'afisha_read_completed', 'afisha_read_failed', 'recommendations_rendered',
+    'reply_finished', 'reply_fallback',
 })
 NUMBERS = frozenset({'duration_ms', 'input_tokens', 'output_tokens', 'search_calls',
                      'update_id', 'status_code', 'retry_after', 'attempt', 'delay_ms', 'error_position',
                      'error_line', 'error_column', 'output_chars', 'repair_attempt', 'max_repairs', 'query_chars', 'result_count',
                      'tool_call_count', 'argument_chars', 'returned_chars', 'model_rounds', 'review_count',
-                     'failure_count', 'dropped_links'})
-AMOUNTS = frozenset({'reserved_usd', 'charged_usd', 'budget_usd'})
+                     'failure_count', 'dropped_links', 'reasoning_tokens', 'model_requests', 'failed_requests',
+                     'searches', 'reader_calls', 'reader_ok', 'skills_loaded', 'json_repairs'})
+AMOUNTS = frozenset({'reserved_usd', 'charged_usd', 'budget_usd', 'spent_usd'})
+OUTCOMES = frozenset({'delivered', 'silent', 'fallback_delivered', 'paused', 'not_directed', 'rate_limited',
+                      'cooldown', 'revoked', 'media_failed', 'media_disabled', 'throttled', 'delivery_failed',
+                      'delivery_unknown', 'gave_up', 'memory_failed', 'model_failed', 'budget_exceeded'})
+FALLBACKS = frozenset({'model_failure', 'budget', 'media_failed', 'memory', 'search_failed', 'settings_failed',
+                       'search_disabled', 'invalid_request'})
 MODELS = frozenset(model for models in PRICES.values() for model in models) | frozenset(VISION_PRICES) | {'glm-asr-2512', 'gpt-transcribe'}
 ENUMS = {'parser_error': frozenset({'expected_value', 'extra_data', 'expected_key',
          'expected_comma', 'expected_colon', 'unterminated_string', 'control_character', 'other'}),
@@ -59,6 +71,7 @@ ENUMS = {'parser_error': frozenset({'expected_value', 'extra_data', 'expected_ke
          'operation': frozenset({'text', 'image', 'transcription', 'web_search'}),
          'stage': frozenset({'configuration', 'database', 'telegram', 'provider', 'running'}),
          'phase': frozenset({'queued', 'prepared', 'generated', 'sending'}),
+         'outcome': OUTCOMES, 'fallback': FALLBACKS,
          'reason': frozenset({'request_failed', 'incomplete', 'invalid_json', 'invalid_settings',
                               'processing_failed', 'telegram_access', 'shutdown', 'startup',
                               'invalid_skill_call', 'skill_loading_failed', 'search_not_executed', 'invalid_search_call',
@@ -121,9 +134,112 @@ def configure_logging(stream=None):
     LOGGER.propagate = False
 
 
+class JobStats:
+    """Per-job tally built from the events themselves; counts and amounts only."""
+    def __init__(self):
+        self.started = time.monotonic()
+        self.model_requests = self.failed_requests = self.searches = 0
+        self.reader_calls = self.reader_ok = self.skills_loaded = self.json_repairs = 0
+        self.input_tokens = self.output_tokens = self.reasoning_tokens = 0
+        self.spent = Decimal('0')
+        self.pending = Decimal('0')
+        self.round_limit = self.budget_exceeded = False
+        self.fallback = None
+
+    def observe(self, name, fields):
+        amount = fields.get('charged_usd') if isinstance(fields.get('charged_usd'), Decimal) else None
+        if name == 'ai_request_started':
+            self.pending = fields.get('reserved_usd') if isinstance(fields.get('reserved_usd'), Decimal) else Decimal('0')
+        elif name in {'ai_request_completed', 'ai_request_failed'}:
+            self.model_requests += 1
+            self.failed_requests += name == 'ai_request_failed'
+            # A failed request keeps its reservation: count it as spent.
+            self.spent += amount if amount is not None else self.pending
+            self.pending = Decimal('0')
+            for key in ('input_tokens', 'output_tokens', 'reasoning_tokens'):
+                if type(fields.get(key)) is int:
+                    setattr(self, key, getattr(self, key) + fields[key])
+        elif name == 'web_search_completed' or (name == 'web_search_failed' and fields.get('reason') == 'request_failed'):
+            self.searches += 1
+            self.spent += amount if amount is not None else (fields.get('reserved_usd') or Decimal('0'))
+        elif name in {'reviews_read_completed', 'reviews_read_failed', 'afisha_read_completed', 'afisha_read_failed'} \
+                and 'review_count' in fields:
+            self.reader_calls += 1
+            self.reader_ok += name.endswith('_completed')
+        elif name == 'skill_returned':
+            self.skills_loaded += 1
+        elif name == 'ai_json_repair_started':
+            self.json_repairs += 1
+        elif name == 'tool_round_limit_reached':
+            self.round_limit = True
+        elif name == 'budget_exceeded':
+            self.budget_exceeded = True
+
+    def summary(self):
+        return dict(model_requests=self.model_requests, failed_requests=self.failed_requests,
+                    searches=self.searches, reader_calls=self.reader_calls, reader_ok=self.reader_ok,
+                    skills_loaded=self.skills_loaded, json_repairs=self.json_repairs,
+                    input_tokens=self.input_tokens, output_tokens=self.output_tokens,
+                    reasoning_tokens=self.reasoning_tokens, spent_usd=self.spent, round_limit=self.round_limit,
+                    budget_exceeded=self.budget_exceeded, fallback=self.fallback,
+                    duration_ms=int((time.monotonic() - self.started) * 1000))
+
+
+# A job's phases can run in separate worker turns; keep a bounded tally per update.
+_JOB_STATS = OrderedDict()
+_JOB_STATS_LOCK = threading.Lock()
+_CURRENT_JOB = contextvars.ContextVar('current_job', default=None)
+
+
+def _stats(update_id):
+    with _JOB_STATS_LOCK:
+        stats = _JOB_STATS.get(update_id)
+        if stats is None:
+            stats = _JOB_STATS[update_id] = JobStats()
+            while len(_JOB_STATS) > 500:
+                _JOB_STATS.popitem(last=False)
+        return stats
+
+
+@contextmanager
+def job_context(update_id):
+    """Every event in this block carries update_id and feeds the job's summary."""
+    token = _CURRENT_JOB.set(update_id if type(update_id) is int else None)
+    if type(update_id) is int:
+        _stats(update_id)  # Start the clock at the first processed phase.
+    try:
+        yield
+    finally:
+        _CURRENT_JOB.reset(token)
+
+
+def fallback(reason, **fields):
+    """The user receives an error message instead of an answer."""
+    update_id = _CURRENT_JOB.get()
+    if update_id is not None and reason in FALLBACKS:
+        _stats(update_id).fallback = reason
+    event('reply_fallback', level=logging.WARNING, fallback=reason, **fields)
+
+
+def job_finished(update_id, outcome, **fields):
+    """One summary line per job; clears its tally."""
+    with _JOB_STATS_LOCK:
+        stats = _JOB_STATS.pop(update_id, None) or JobStats()
+    if stats.fallback and outcome == 'delivered':
+        outcome = 'fallback_delivered'
+    summary = stats.summary()
+    event('reply_finished', level=logging.WARNING if outcome in {'delivery_failed', 'gave_up'} else logging.INFO,
+          update_id=update_id, outcome=outcome, **{**summary, **fields})
+
+
 def event(name, *, level=logging.INFO, **fields):
     if name not in EVENTS:
         return
+    current = _CURRENT_JOB.get()
+    if current is not None:
+        fields.setdefault('update_id', current)
+        if name not in {'reply_finished', 'reply_fallback'}:
+            _stats(current).observe(name, fields)
     data = {'event': name}
     for key, value in fields.items():
         if key in ENUMS and isinstance(value, str) and value in ENUMS[key]:
@@ -137,7 +253,8 @@ def event(name, *, level=logging.INFO, **fields):
         elif key in {'json_request_id', 'search_request_id', 'reviews_request_id'} and isinstance(value, str) and re.fullmatch(r'[0-9a-f]{32}', value):
             data[key] = value
         elif key in {'responded', 'web_search_enabled', 'previous_answer_included', 'error_feedback_included',
-                     'explicit_search_available', 'filters_applied'} and type(value) is bool:
+                     'explicit_search_available', 'filters_applied', 'round_limit', 'budget_exceeded',
+                     'directed'} and type(value) is bool:
             data[key] = value
     if name in {'ai_output_invalid', 'ai_json_repair_started', 'ai_json_repair_failed',
                 'ai_json_repair_exhausted'} and data.get('validation_error') in VALIDATION_DETAILS:
