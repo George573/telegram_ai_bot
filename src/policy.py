@@ -70,4 +70,6 @@ def normalize(update, allowed, bot):
         user_id=sender.get('id'), anonymous=bool(message.get('sender_chat')),
         text=text, command=command, argument=argument, reply_to_bot=reply, media=media,
         directed=bool(command or addressed(text, bot['username'], reply)),
-        thread_id=message.get('message_thread_id'))
+        # Ordinary supergroups also set message_thread_id for reply chains; only
+        # forum topics are separate conversations that accept it on send.
+        thread_id=message.get('message_thread_id') if message.get('is_topic_message') else None)
