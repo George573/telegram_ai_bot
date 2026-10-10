@@ -109,7 +109,7 @@ class SkillLoadingTests(unittest.TestCase):
                         return self.response(provider, call=('load_skill', '{"name":"nearby-places"}'), searched=True)
                     if len(bodies) == 2:
                         return self.response(provider, text='Malformed conversational answer')
-                    return self.response(provider, text='{"respond":true,"reply":"Cafe"}')
+                    return self.response(provider, text='{"respond":true,"reply":"Cafe, see example.com"}')
                 answer = self.model(provider, handler).decide_reply('Cat', [], allow_search=True)
                 self.assertIn('Cafe', answer)
                 self.assertIn('https://example.com/cafe', answer)

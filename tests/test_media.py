@@ -145,7 +145,7 @@ class SearchAndMediaModelTests(unittest.TestCase):
                 return SimpleNamespace(status='completed', output_text='', usage=usage, output=[
                     {'type': 'function_call', 'call_id': 'c1', 'name': 'search_web',
                      'arguments': '{"query":"exhibitions metro","site":null,"recency":"week"}'}])
-            return SimpleNamespace(status='completed', output_text='Exhibition near the metro', usage=usage, output=[])
+            return SimpleNamespace(status='completed', output_text='Exhibition near the metro (example.com)', usage=usage, output=[])
         model = self.model(create)
         store, telegram = MemoryStore(), FakeTelegram()
         store.chat['web_enabled'] = True

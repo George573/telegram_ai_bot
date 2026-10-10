@@ -18,6 +18,7 @@ from storage import BudgetExceeded
 from test_clients import Allowance
 from test_service import MemoryStore, FakeTelegram, FakeModel, payload
 from providers import SearchOutcome
+from model import MAX_SEARCHES, cited_sources
 from test_skill_loading import cards
 
 
@@ -157,9 +158,13 @@ class SearchTests(unittest.TestCase):
                 patch.object(model.provider, 'search', return_value=SearchOutcome([])) as search:
             self.assertEqual(model.generate('Lookup', [], allow_search=True), 'Done')
         self.assertEqual(generate.call_count, 6)
-        self.assertEqual(search.call_count, 8)
-        rejected = [item for item in generate.call_args.kwargs['continuation'] if 'too_many_calls' in str(item)]
-        self.assertEqual(len(rejected), 4)
+        # Per step: 4 run, 4 too_many_calls. Per request: at most MAX_SEARCHES run, the rest search_limit.
+        self.assertEqual(search.call_count, MAX_SEARCHES)
+        continuation = generate.call_args.kwargs['continuation']
+        self.assertEqual(len([item for item in continuation if 'too_many_calls' in str(item)]), 4)
+        self.assertEqual(len([item for item in continuation if 'search_limit' in str(item)]), 3)
+        self.assertIn('last research step', generate.call_args_list[4].args[0])
+        self.assertNotIn('last research step', generate.call_args_list[3].args[0])
         final = generate.call_args
         self.assertFalse(final.args[4])
         self.assertFalse(final.args[6])
@@ -189,7 +194,7 @@ class SearchTests(unittest.TestCase):
             self.assertTrue(any(m['role'] == 'assistant' and m['content'] == 'Invalid plain answer'
                                 for m in body['messages']))
             self.assertTrue(any('JSON validation feedback' in str(m['content']) for m in body['messages']))
-            return self.response(text='{"respond":true,"reply":"Cafe found"}')
+            return self.response(text='{"respond":true,"reply":"Cafe found at example.com"}')
         with patch('model.event') as log:
             decision = self.model(handler).decide_reply('Lookup', [], allow_search=True)
         self.assertIn('Cafe found', decision)
@@ -395,10 +400,29 @@ class SearchTests(unittest.TestCase):
             if len(generations) == 1:
                 self.assertEqual(body['tools'][0]['function']['name'], 'load_skill')
                 return self.tool_response('search_web', '{"query":"public fact","site":null,"recency":null}')
-            return self.response(text='{"respond":true,"reply":"Fact"}')
+            return self.response(text='{"respond":true,"reply":"Fact (example.com)"}')
         answer = self.model(handler).decide_reply('Cat', [], allow_search=True)
         self.assertIn('https://example.com/fact', answer)
         self.assertNotIn('10.0.0.1', answer)
+
+
+class CitedSourceTests(unittest.TestCase):
+    def test_only_sources_the_answer_uses_are_appended(self):
+        sources = [('Junk', 'https://kartaslov.ru/x'), ('Cafe', 'https://www.pinocoffee.ru/menu'),
+                   ('Яндекс Карты: отзывы', 'https://yandex.ru/maps/org/1/reviews/')]
+        kept = cited_sources('Загляните в PinoCoffee (pinocoffee.ru), отзывы хорошие.', sources)
+        self.assertEqual([url for _, url in kept], ['https://www.pinocoffee.ru/menu', 'https://yandex.ru/maps/org/1/reviews/'])
+        self.assertEqual(cited_sources('Без ссылок', sources[:2]), [])
+
+    def test_final_answer_forbids_promises_of_later_work(self):
+        model = SearchTests().model(lambda _: None)
+        from providers import Generation, ToolCall
+        calls = [Generation('', True, tool_calls=(ToolCall(f'c{i}', 'search_web', '{"query":"q"}'),)) for i in range(5)]
+        with patch.object(model, '_generation_attempt', side_effect=calls + [Generation('Ответ', True)]) as generate, \
+                patch.object(model.provider, 'search', return_value=SearchOutcome([])):
+            model.generate('Lookup', [], allow_search=True)
+        self.assertIn('this message is the final result', generate.call_args.args[0])
+        self.assertIn('never promise to search again', generate.call_args_list[0].args[0])
 
 
 class TypingTests(unittest.TestCase):

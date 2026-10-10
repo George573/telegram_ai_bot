@@ -107,7 +107,7 @@ class DecisionTests(unittest.TestCase):
     def test_repair_disables_tools_and_preserves_existing_search_sources(self):
         model, _ = self.model([])
         with patch.object(model, 'generate', side_effect=[ModelText('bad', [('private', 'https://example.com')]),
-                            ModelText('{"respond":true,"reply":"Hello"}', [])]) as generate:
+                            ModelText('{"respond":true,"reply":"Hello from example.com"}', [])]) as generate:
             self.assertIn('https://example.com', model.decide_reply('Cat', [], allow_search=True))
         self.assertTrue(generate.call_args_list[0].kwargs['allow_search'])
         self.assertFalse(generate.call_args_list[1].kwargs['allow_search'])

@@ -194,7 +194,7 @@ class ClientTests(unittest.TestCase):
                 return httpx.Response(200, json={**base, 'output': [{'type': 'function_call', 'id': 'fc', 'call_id': 'c',
                     'name': 'search_web', 'arguments': '{"query":"fact","site":null,"recency":null}', 'status': 'completed'}]})
             self.assertNotIn('tool_choice', body)
-            return httpx.Response(200, json={**base, 'output': message('Hello')})
+            return httpx.Response(200, json={**base, 'output': message('Hello, per example.com')})
         http = httpx.Client(transport=httpx.MockTransport(handler), trust_env=False)
         self.addCleanup(http.close)
         client = OpenAI(api_key='fake-key', http_client=http, max_retries=0)

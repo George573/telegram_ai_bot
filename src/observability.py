@@ -66,7 +66,7 @@ ENUMS = {'parser_error': frozenset({'expected_value', 'extra_data', 'expected_ke
                               'not_found', 'access_denied', 'redirected', 'reviews_not_loaded', 'no_review_texts',
                               'busy', 'invalid_url', 'context_budget', 'too_many_calls', 'review_limit',
                               'unexpected_error', 'retry_scheduled', 'gave_up', 'invalid_arguments', 'no_events',
-                              'event_not_loaded'})}
+                              'event_not_loaded', 'search_limit'})}
 
 VALIDATION_DETAILS = {
     'malformed_json': 'Ответ не удалось разобрать как JSON.',
