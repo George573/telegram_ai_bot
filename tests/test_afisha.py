@@ -199,7 +199,7 @@ class AfishaToolLoopTests(unittest.TestCase):
                   for i in range(4)]
         with patch.object(model, '_generation_attempt', side_effect=[
                 Generation('', True, tool_calls=(reads[0],)), Generation('', True, tool_calls=tuple(reads[1:])),
-                Generation('Done', True)]) as generate, \
+                Generation(skill_tests.cards('Done'), True)]) as generate, \
                 patch('model.read_afisha_listing', return_value=listing) as read_listing, \
                 patch('model.read_afisha_event', side_effect=lambda url, base: {**event, 'url': url}) as read_event, \
                 patch('model.datetime') as clock:
@@ -214,7 +214,7 @@ class AfishaToolLoopTests(unittest.TestCase):
         calls = (ToolCall('a', 'read_afisha_event', '{"url":"https://afisha.yandex.ru/moscow/search/x"}'),
                  ToolCall('b', 'read_afisha_listing', '{"category":"opera","date_from":"2026-10-12","days":3}'))
         with patch.object(model, '_generation_attempt', side_effect=[Generation('', True, tool_calls=calls),
-                Generation('Done', True)]) as generate, patch('model.read_afisha_event') as read_event, \
+                Generation(skill_tests.cards('Done'), True)]) as generate, patch('model.read_afisha_event') as read_event, \
                 patch('model.read_afisha_listing') as read_listing:
             model.generate('Theatre?', [], allow_search=True)
         read_event.assert_not_called()

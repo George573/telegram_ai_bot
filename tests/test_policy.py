@@ -31,7 +31,7 @@ class PolicyTests(unittest.TestCase):
         state = {'personality': dict(style='s'*800, when='w'*800, lore='l'*2000,
                                     names=['n'*40]*10, language='x'*80)}
         self.assertLessEqual(len(describe(state)), 3500)
-        self.assertIn('stored settings are intact', describe(state))
+        self.assertIn('сохранённые настройки целы', describe(state))
 
     def test_configured_lore_is_the_only_identity_in_prompt(self):
         from personality import instructions

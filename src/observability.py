@@ -33,6 +33,8 @@ EVENTS = frozenset({
     'afisha_read_started', 'afisha_read_completed', 'afisha_read_failed', 'recommendations_rendered',
     'reply_finished', 'reply_fallback',
     'maps_search_read_started', 'maps_search_read_completed', 'maps_search_read_failed',
+    'callback_received', 'callback_failed', 'prompt_created', 'prompt_answered', 'progress_shown',
+    'crash_notice_sent', 'status_message_edited', 'status_message_failed', 'commands_registered',
 })
 NUMBERS = frozenset({'duration_ms', 'input_tokens', 'output_tokens', 'search_calls',
                      'update_id', 'status_code', 'retry_after', 'attempt', 'delay_ms', 'error_position',
@@ -41,7 +43,7 @@ NUMBERS = frozenset({'duration_ms', 'input_tokens', 'output_tokens', 'search_cal
                      'failure_count', 'dropped_links', 'dropped_items', 'reasoning_tokens', 'model_requests', 'failed_requests',
                      'searches', 'reader_calls', 'reader_ok', 'skills_loaded', 'json_repairs'})
 AMOUNTS = frozenset({'reserved_usd', 'charged_usd', 'budget_usd', 'spent_usd'})
-OUTCOMES = frozenset({'delivered', 'silent', 'fallback_delivered', 'paused', 'not_directed', 'rate_limited',
+OUTCOMES = frozenset({'accepted', 'refused', 'delivered', 'silent', 'fallback_delivered', 'paused', 'not_directed', 'rate_limited',
                       'cooldown', 'revoked', 'media_failed', 'media_disabled', 'throttled', 'delivery_failed',
                       'delivery_unknown', 'gave_up', 'memory_failed', 'model_failed', 'budget_exceeded'})
 FALLBACKS = frozenset({'model_failure', 'budget', 'media_failed', 'memory', 'search_failed', 'settings_failed',
@@ -82,7 +84,7 @@ ENUMS = {'parser_error': frozenset({'expected_value', 'extra_data', 'expected_ke
                               'busy', 'invalid_url', 'context_budget', 'too_many_calls', 'review_limit',
                               'unexpected_error', 'retry_scheduled', 'gave_up', 'invalid_arguments', 'no_events',
                               'event_not_loaded', 'search_limit', 'no_results', 'page_changed', 'too_large',
-                              'timeout_or_network'})}
+                              'timeout_or_network', 'formatting_rejected'})}
 
 VALIDATION_DETAILS = {
     'malformed_json': 'Ответ не удалось разобрать как JSON.',
@@ -258,7 +260,7 @@ def event(name, *, level=logging.INFO, **fields):
             data[key] = value
         elif key in {'responded', 'web_search_enabled', 'previous_answer_included', 'error_feedback_included',
                      'explicit_search_available', 'filters_applied', 'round_limit', 'budget_exceeded',
-                     'directed'} and type(value) is bool:
+                     'directed', 'notified'} and type(value) is bool:
             data[key] = value
     if name in {'ai_output_invalid', 'ai_json_repair_started', 'ai_json_repair_failed',
                 'ai_json_repair_exhausted'} and data.get('validation_error') in VALIDATION_DETAILS:

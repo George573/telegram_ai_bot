@@ -7,7 +7,8 @@ import logging
 from concurrent.futures import ThreadPoolExecutor
 from config import Config
 from model import Model, RequestPacer
-from policy import normalize
+from policy import normalize, normalize_callback
+import texts
 from service import Service
 from storage import Store
 from telegram_api import TelegramAPI, TelegramFailure
@@ -72,7 +73,8 @@ def accept_update(service, store, config, identity, update, failures):
     """Accept one update; after repeated unexpected failures, skip it instead of exiting."""
     update_id = update.get('update_id')
     try:
-        service.accept(update_id, normalize(update, config.chats, identity))
+        parse = normalize_callback if 'callback_query' in update else normalize
+        service.accept(update_id, parse(update, config.chats, identity))
         failures.pop(update_id, None)
         return True
     except TelegramFailure:
@@ -102,6 +104,12 @@ def main():
         stage = 'telegram'
         telegram = TelegramAPI(config.telegram_token)
         identity = telegram.call('getMe')
+        try:
+            # Russian command menu; a failure must never block startup.
+            telegram.set_commands(texts.PUBLIC_COMMANDS, texts.ADMIN_COMMANDS)
+            event('commands_registered', outcome='delivered')
+        except TelegramFailure as error:
+            event('commands_registered', level=logging.WARNING, outcome='delivery_failed', status_code=error.code)
         if store.discard_backlog_required():
             telegram.call('deleteWebhook', drop_pending_updates=True)
             store.backlog_discarded()
@@ -125,7 +133,7 @@ def main():
                 scheduler.tick(store.runnable_chats())
                 try:
                     updates = telegram.call('getUpdates', offset=store.checkpoint(), limit=100,
-                        timeout=1, allowed_updates=['message'])
+                        timeout=1, allowed_updates=['message', 'callback_query'])
                     for update in updates:
                         if not accept_update(service, store, config, identity, update, update_failures):
                             # Keep order: retry from this update on the next poll.

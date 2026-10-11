@@ -11,6 +11,7 @@ import threading
 from urllib.parse import urlsplit
 from uuid import uuid4
 from observability import event, skill_event
+import texts
 from providers import (PRICES as PROVIDER_PRICES, WEB_CALL_COST, TRANSCRIPTION_PER_MINUTE,
                        create_provider, citation_sources, model_prices, TRANSCRIPTION_RATES,
                        VOICE_MAX_SECONDS, IMAGE_MAX_BYTES, provider_error_code, zai_retry_delay)
@@ -55,6 +56,7 @@ READER_HINTS = {
 READ_EVENTS = {'read_yandex_maps_search': 'maps_search_read', 'read_yandex_reviews': 'reviews_read',
                'read_afisha_listing': 'afisha_read', 'read_afisha_event': 'afisha_read'}
 TOOL_NAMES = frozenset({'load_skill', 'search_web'} | set(READER_LIMITS))
+CARD_READERS = frozenset({'read_yandex_maps_search', 'read_afisha_listing', 'read_afisha_event'})
 
 
 def search_arguments(arguments):
@@ -85,15 +87,21 @@ def cited_sources(text, sources):
 
 
 def with_sources(text, sources, max_chars=3500):
-    suffix = '\n\nSources:\n' + '\n'.join(f'{title}: {url}' for title, url in sources) if sources else ''
+    suffix = '\n\n' + texts.SOURCES + '\n' + '\n'.join(f'{title}: {url}' for title, url in sources) if sources else ''
     return text[:max(0, max_chars-len(suffix))] + suffix
 
 
 class ModelText(str):
-    def __new__(cls, text, sources):
+    def __new__(cls, text, sources=(), cards=False):
         result = super().__new__(cls, text)
         result.sources = sources
+        # True when the text is rendered recommendation cards (follow-up buttons apply).
+        result.cards = cards
         return result
+
+    def __reduce__(self):
+        # Keep sources and the cards flag through copy/pickle.
+        return (ModelText, (str(self), self.sources, self.cards))
 
 
 class ModelFailure(Exception):
@@ -248,7 +256,8 @@ class Model:
                       delay_ms=int(delay * 1000), reserved_usd=reserved)
                 time.sleep(delay)
 
-    def generate(self, instructions, history, output_tokens=None, max_chars=3500, response_format=None, allow_search=False, image=None, require_search=False):
+    def generate(self, instructions, history, output_tokens=None, max_chars=3500, response_format=None, allow_search=False,
+                 image=None, require_search=False, on_research=None):
         output_tokens = output_tokens or self.config.max_output_tokens
         allow_search = allow_search and 'web' in self.provider.capabilities
         if image is not None and 'images' not in self.provider.capabilities:
@@ -313,6 +322,15 @@ class Model:
             continuation += response.continuation + (self.provider.skill_result(call, text),)
         def rejected(reason, notice):
             return json.dumps({'status': 'unavailable', 'reason': reason, 'notice': notice})
+        def researching(tool):
+            # Tell the caller once that slow research has started (e.g. to show «Ищу…»).
+            nonlocal on_research
+            if on_research is not None:
+                callback, on_research = on_research, None
+                try:
+                    callback(tool)
+                except Exception:
+                    event('status_message_failed', level=logging.WARNING)
         def remember(result):
             nonlocal reader_confirmed
             evidence.update(evidence_urls(result))
@@ -401,7 +419,12 @@ class Model:
                 arguments = json.loads(call.arguments, object_pairs_hook=unique_arguments)
                 tool_error = 'invalid_arguments'
                 if call.name in READER_LIMITS:
+                    researching(call.name)
                     tool_output(call, self._reader_call(call, arguments, reader_results, reader_counts, remember, sources))
+                    if (call.name in CARD_READERS and response_format is None and result_format is None):
+                        # Place/event research produces cards even if the model skipped load_skill.
+                        result_format = recommendations.FORMAT
+                        instructions += recommendations.INSTRUCTIONS
                     continue
                 if call.name == 'search_web':
                     query, site, recency = search_arguments(arguments)
@@ -413,6 +436,7 @@ class Model:
                             'Answer now with the evidence already gathered and name what is still unverified.'))
                         continue
                     searches += 1
+                    researching('search_web')
                     results, applied = self._search_web(query, site, recency)
                     search_confirmed = True  # Empty results are still a completed search.
                     for result in results:
@@ -537,7 +561,7 @@ class Model:
         text, dropped, removed = recommendations.render(value, evidence, max_chars or 3500, excluded_names)
         event('recommendations_rendered', **fields, result_count=len(value['items']) - removed,
               dropped_links=dropped, dropped_items=removed)
-        return ModelText(text, sources[:3])
+        return ModelText(text, sources[:3], cards=bool(value['items']))
 
     def _tool_batch_error(self, calls, allow_search):
         if not allow_search:

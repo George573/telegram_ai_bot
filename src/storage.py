@@ -81,6 +81,17 @@ CREATE TABLE rate_limits (
  PRIMARY KEY(chat_id,subject_id,kind));
 """,
     "ALTER TABLE jobs ADD COLUMN failures INTEGER NOT NULL DEFAULT 0;",
+    """
+ALTER TABLE jobs ADD COLUMN markup JSONB;
+ALTER TABLE jobs ADD COLUMN reply_prompt TEXT;
+ALTER TABLE jobs ADD COLUMN status_message_id BIGINT;
+CREATE TABLE prompts (
+ chat_id BIGINT NOT NULL, message_id BIGINT NOT NULL, user_id BIGINT NOT NULL,
+ command TEXT NOT NULL, skill TEXT, expires_at TIMESTAMPTZ NOT NULL,
+ PRIMARY KEY(chat_id,message_id));
+CREATE INDEX prompts_user_idx ON prompts(chat_id,user_id);
+""",
+    "ALTER TABLE chats ADD COLUMN menu_button BOOLEAN NOT NULL DEFAULT FALSE;",
 )
 
 
@@ -237,6 +248,7 @@ class Store:
                 self.conn.execute("UPDATE conversations SET summary='',summary_started_at=NULL WHERE NOT (chat_id=ANY(%s::bigint[])) AND summary_started_at < now()-%s * interval '1 day'", (active,self.retention_days))
             self.conn.execute("DELETE FROM jobs WHERE NOT ((payload->>'chat_id')::bigint=ANY(%s::bigint[])) AND created_at < now()-interval '24 hours'", (active,))
             self.conn.execute('DELETE FROM personality_drafts WHERE expires_at<=now()')
+            self.conn.execute('DELETE FROM prompts WHERE expires_at<=now()')
             self.conn.execute("DELETE FROM rate_limits WHERE updated_at < now()-interval '1 hour'")
 
     def forget_user(self, chat_id, user_id, update_id):
@@ -248,6 +260,7 @@ class Store:
             self.conn.execute("DELETE FROM messages WHERE chat_id=%s AND sender_id IS NULL AND role='user'", (chat_id,))
             self.conn.execute("UPDATE conversations SET summary='',summary_started_at=NULL WHERE chat_id=%s", (chat_id,))
             self.delete_drafts(chat_id, user_id)
+            self.conn.execute('DELETE FROM prompts WHERE chat_id=%s AND user_id=%s', (chat_id, user_id))
             self.conn.execute("DELETE FROM jobs WHERE payload->>'chat_id'=%s AND update_id<>%s AND (payload->>'user_id'=%s OR phase<>'queued')", (str(chat_id),update_id,str(user_id)))
 
     def clear(self, chat_id):
@@ -256,7 +269,8 @@ class Store:
         self.conn.execute("UPDATE conversations SET summary='',summary_started_at=NULL WHERE chat_id=%s", (chat_id,))
 
     def setting(self, chat_id, field, value):
-        if field not in {'persona', 'mode', 'paused', 'history_limit', 'personality', 'images_enabled', 'voice_enabled', 'web_enabled'}:
+        if field not in {'persona', 'mode', 'paused', 'history_limit', 'personality', 'images_enabled', 'voice_enabled',
+                         'web_enabled', 'menu_button'}:
             raise ValueError('Invalid setting')
         if field == 'personality':
             value = Jsonb(value)
@@ -315,8 +329,26 @@ class Store:
             next_attempt_at=now()+%s * interval '1 second' WHERE update_id=%s''',
             (max(1, seconds), job['update_id']))
 
-    def phase(self, update_id, phase, answer=None, assistant=False):
-        self.conn.execute('UPDATE jobs SET phase=%s,answer=%s,assistant=%s WHERE update_id=%s', (phase,answer,assistant,update_id))
+    def phase(self, update_id, phase, answer=None, assistant=False, markup=None, reply_prompt=None):
+        self.conn.execute('''UPDATE jobs SET phase=%s,answer=%s,assistant=%s,markup=%s,reply_prompt=%s
+            WHERE update_id=%s''', (phase,answer,assistant,Jsonb(markup) if markup is not None else None,reply_prompt,update_id))
+
+    def set_status_message(self, update_id, message_id):
+        """The progress/crash-notice message to edit instead of sending another one."""
+        self.conn.execute('UPDATE jobs SET status_message_id=%s WHERE update_id=%s', (message_id, update_id))
+
+    def save_prompt(self, chat_id, message_id, user_id, command, skill=None, minutes=30):
+        self.conn.execute('''INSERT INTO prompts(chat_id,message_id,user_id,command,skill,expires_at)
+            VALUES(%s,%s,%s,%s,%s,now()+%s*interval '1 minute') ON CONFLICT(chat_id,message_id)
+            DO UPDATE SET user_id=EXCLUDED.user_id,command=EXCLUDED.command,skill=EXCLUDED.skill,
+            expires_at=EXCLUDED.expires_at''', (chat_id, message_id, user_id, command, skill, minutes))
+
+    def prompt(self, chat_id, message_id):
+        return self.conn.execute('''SELECT user_id,command,skill FROM prompts
+            WHERE chat_id=%s AND message_id=%s AND expires_at>now()''', (chat_id, message_id)).fetchone()
+
+    def delete_prompt(self, chat_id, message_id):
+        self.conn.execute('DELETE FROM prompts WHERE chat_id=%s AND message_id=%s', (chat_id, message_id))
 
     def converted(self, update_id, payload):
         self.conn.execute("UPDATE jobs SET payload=%s,phase='queued' WHERE update_id=%s", (Jsonb(payload), update_id))

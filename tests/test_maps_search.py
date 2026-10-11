@@ -176,7 +176,7 @@ class ModelLoopTests(unittest.TestCase):
         self.assertNotIn('Surf Coffee', text)
         self.assertNotIn('161860189832', text)
         self.assertNotIn('surfcoffee.ru', text)
-        self.assertIn('1. ☕ Кофеин', text)
+        self.assertIn('1. ☕ **Кофеин**', text)
         result = json.loads(generate.call_args.kwargs['continuation'][-1]['content'])
         self.assertNotIn('Surf Coffee', [r['name'] for r in result['results']])
 
@@ -187,7 +187,7 @@ class ModelLoopTests(unittest.TestCase):
         calls += [ToolCall(f'c{i}', 'read_yandex_maps_search', json.dumps({'query': f'кафе {i}', 'exclude_chains': False}))
                   for i in range(4)]
         with patch.object(model, '_generation_attempt', side_effect=[Generation('', True, tool_calls=tuple(calls[:2])),
-                Generation('', True, tool_calls=tuple(calls[2:])), Generation('Done', True)]) as generate, \
+                Generation('', True, tool_calls=tuple(calls[2:])), Generation(skill_tests.cards('Done'), True)]) as generate, \
                 patch('model.read_maps_search', return_value=maps.normalized_search('u', NIKOLSKAYA)) as read:
             model.generate('Persona', [], allow_search=True)
         self.assertEqual(read.call_count, 3)

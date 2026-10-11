@@ -16,6 +16,7 @@ class MemoryStore:
     def __init__(self):
         self.chat = dict(id=-1, persona='Cat', mode='directed', paused=False, history_limit=10, summary='')
         self.rows, self.jobs, self.drafts = [], [], {}
+        self.prompts, self.forgotten = {}, []
         self.next_id = 1
     @contextmanager
     def transaction(self):
@@ -37,10 +38,24 @@ class MemoryStore:
     def spent(self): return Decimal('0')
     def cooling_down(self, *_): return False
     def mark_reply(self, _): pass
-    def phase(self, update, phase, answer=None, assistant=False):
+    def phase(self, update, phase, answer=None, assistant=False, markup=None, reply_prompt=None):
         for job in self.jobs:
             if job['update_id'] == update:
-                job.update(phase=phase, answer=answer, assistant=assistant)
+                job.update(phase=phase, answer=answer, assistant=assistant, markup=markup, reply_prompt=reply_prompt)
+    def job(self, update):
+        return next((deepcopy(j) for j in self.jobs if j['update_id'] == update), None)
+    def set_status_message(self, update, message_id):
+        for job in self.jobs:
+            if job['update_id'] == update:
+                job['status_message_id'] = message_id
+    def save_prompt(self, chat, message_id, user_id, command, skill=None):
+        self.prompts[chat, message_id] = {'user_id': user_id, 'command': command, 'skill': skill}
+    def prompt(self, chat, message_id):
+        return deepcopy(self.prompts.get((chat, message_id)))
+    def delete_prompt(self, chat, message_id):
+        self.prompts.pop((chat, message_id), None)
+    def forget_user(self, chat, user, update):
+        self.forgotten.append(user)
     def finish(self, update): self.jobs = [j for j in self.jobs if j['update_id'] != update]
     def next_job(self): return deepcopy(self.jobs[0]) if self.jobs else None
     def retry_delivery(self, job, seconds):
@@ -66,13 +81,29 @@ class MemoryStore:
 
 
 class FakeTelegram:
-    def __init__(self, admin=False, fail=False): self.admin, self.fail, self.sent = admin, fail, []
+    def __init__(self, admin=False, fail=False):
+        self.admin, self.fail, self.sent = admin, fail, []
+        self.outbox, self.edits, self.callbacks, self.cleared = [], [], [], []
+        self.next_message_id = 500
     def download(self, file_id, limit):
         return b'\xff\xd8\xffphoto'
     def is_admin(self, payload): return self.admin and not payload['anonymous']
-    def send(self, payload, answer):
+    def send(self, payload, answer, markup=None, force_reply=None):
         if self.fail: raise TelegramFailure()
         self.sent.append(answer)
+        self.next_message_id += 1
+        self.outbox.append({'text': answer, 'markup': markup, 'force_reply': force_reply,
+                            'message_id': self.next_message_id, 'reply_to': payload.get('message_id')})
+        return {'message_id': self.next_message_id}
+    def edit(self, chat_id, message_id, text, markup=None):
+        if self.fail: raise TelegramFailure()
+        self.sent.append(text)
+        self.edits.append({'message_id': message_id, 'text': text, 'markup': markup})
+        return {'message_id': message_id}
+    def clear_buttons(self, chat_id, message_id):
+        self.cleared.append(message_id)
+    def answer_callback(self, callback_id, text=None):
+        self.callbacks.append(text)
 
 
 class FakeModel:
@@ -152,8 +183,18 @@ class ServiceTests(unittest.TestCase):
         self.tg.admin = True
         self.store.append(-1,'user','old'); self.store.chat['summary']='old summary'
         self.run_job('/resetmemory')
+        # Destructive: asks first, bound to the requester.
+        self.assertEqual(len(self.store.rows), 1)
+        confirmation = self.tg.outbox[-1]
+        self.assertIn('Очистить всю память', confirmation['text'])
+        press = payload('Да'); press.update(command='/confirm', argument='yes', from_button=True,
+                                           panel_message_id=confirmation['message_id'], callback_id='cb')
+        self.service.accept(2, press)
+        for _ in range(4):
+            if self.service.process_one() is None: break
         self.assertEqual(self.store.rows, [])
         self.assertEqual(self.store.chat['summary'], '')
+        self.assertEqual(self.tg.edits[-1]['message_id'], confirmation['message_id'])
     def test_summary_failure_preserves_all_sources(self):
         self.model.fail = True
         for i in range(15): self.store.append(-1,'user',str(i))
@@ -248,7 +289,8 @@ class ServiceTests(unittest.TestCase):
         self.reply_in_wizard('Теплый армянский друг Армен, часто вступает в разговор')
         self.assertNotIn('personality', self.store.chat)
         self.assertFalse(self.store.rows)
-        self.assertIn('Preview only', self.tg.sent[-1])
+        self.assertIn('Это только превью', self.tg.sent[-1])
+        self.assertEqual(self.tg.outbox[-1]['markup'][0][0][1], 'v1:pers:save')
         self.service = Service(self.config, self.store, self.tg, self.model)
         self.reply_in_wizard('да')
         self.assertEqual(self.store.chat['personality']['names'], ['Армен', 'Ара'])
@@ -302,14 +344,14 @@ class ServiceTests(unittest.TestCase):
         self.service = Service(self.config, self.store, self.tg, self.model)
         def unavailable(_): raise AssertionError('Super admin must not need Telegram admin lookup')
         self.tg.is_admin = unavailable
-        self.run_job('/setprompt A warm friend')
-        self.assertEqual(self.store.chat['persona'], 'A warm friend')
+        self.run_job('/images off')
+        self.assertFalse(self.store.chat['images_enabled'])
         self.run_job('/context all')
         self.assertEqual(self.store.chat['mode'], 'all')
         self.run_job('/pause')
         self.assertTrue(self.store.chat['paused'])
         self.run_job('/help')
-        self.assertIn('/personality save', self.tg.sent[-1])
+        self.assertIn('v1:help:admin', str(self.tg.outbox[-1]['markup']))
         p = payload('/resume'); p['anonymous'] = True
         self.service.accept(1, p); self.service.process_one()
         self.assertTrue(self.store.chat['paused'])
@@ -365,20 +407,17 @@ class ServiceTests(unittest.TestCase):
         self.assertFalse(self.model.calls)
         self.assertFalse(self.tg.sent)
 
-    def test_setprompt_replaces_existing_character_lore(self):
+    def test_setprompt_is_no_longer_a_command(self):
+        # /personality (with preview) replaced the raw prompt command.
         self.tg.admin = True
-        self.store.chat['personality'] = {'lore': 'Old identity', 'style': 'Short', 'names': ['Армен']}
         self.run_job('/setprompt A pirate')
-        self.assertEqual(self.store.chat['personality']['lore'], '')
-        self.assertEqual(self.store.chat['personality']['names'], ['Армен'])
-        self.run_job('/chat Who are you?')
-        self.assertIn('A pirate', self.model.calls[-1][0])
-        self.assertNotIn('Old identity', self.model.calls[-1][0])
+        self.assertEqual(self.store.chat['persona'], 'Cat')
+        self.assertFalse(self.tg.sent)
 
     def test_status_reports_startup_privacy_and_incidental_cooldown(self):
         self.tg.admin = True
         self.service.privacy_enabled = True
         self.run_job('/status')
-        self.assertIn('BotFather privacy (at startup): enabled', self.tg.sent[-1])
-        self.assertIn('incidental reply cooldown: 10s', self.tg.sent[-1])
+        self.assertIn('Приватность BotFather (при запуске): включена', self.tg.sent[-1])
+        self.assertIn('Пауза для ответов без обращения: 10 с', self.tg.sent[-1])
         self.assertFalse(self.model.calls)

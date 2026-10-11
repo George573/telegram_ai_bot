@@ -4,16 +4,19 @@ import time
 import logging
 from contextlib import contextmanager
 from observability import event
+from telegram_format import to_html
 import httpx
 
 
 class TelegramFailure(Exception):
-    def __init__(self, code=0, retry_after=0, not_sent=False):
+    def __init__(self, code=0, retry_after=0, not_sent=False, not_modified=False):
         super().__init__('Telegram request failed')
         self.code = code
         self.retry_after = retry_after
         # True only when the request certainly never reached Telegram (connect failure).
         self.not_sent = not_sent
+        # An edit with identical content: harmless, the message already shows it.
+        self.not_modified = not_modified
 
 
 # Shared by poller and worker clients: repeated commands must not flood getChatAdministrators.
@@ -33,7 +36,9 @@ class TelegramAPI:
             response = self._http.post(self._base + method, json=params)
             body = response.json()
             if not body.get('ok'):
-                raise TelegramFailure(body.get('error_code', 0), body.get('parameters', {}).get('retry_after', 0))
+                description = str(body.get('description') or '')
+                raise TelegramFailure(body.get('error_code', 0), body.get('parameters', {}).get('retry_after', 0),
+                                      not_modified='message is not modified' in description)
             return body['result']
         except TelegramFailure:
             raise
@@ -103,13 +108,75 @@ class TelegramAPI:
             # A bounded HTTP call may still be in flight. Do not hold up delivery.
             worker.join(timeout=0)
 
-    def send(self, job, text):
-        params = dict(chat_id=job['chat_id'], text=text,
-            reply_parameters={'message_id': job['message_id'], 'allow_sending_without_reply': False},
+    @staticmethod
+    def reply_markup(markup=None, force_reply=None):
+        """Inline buttons as [[(label, callback_data), ...], ...], a selective ForceReply prompt,
+        or the pinned menu keyboard ({'keyboard': label} / {'remove': True})."""
+        if force_reply is not None:
+            return {'force_reply': True, 'selective': True, 'input_field_placeholder': force_reply[:64]}
+        if isinstance(markup, dict) and markup.get('remove'):
+            return {'remove_keyboard': True}
+        if isinstance(markup, dict) and isinstance(markup.get('keyboard'), str):
+            return {'keyboard': [[{'text': markup['keyboard'][:64]}]], 'is_persistent': True, 'resize_keyboard': True}
+        if markup:
+            return {'inline_keyboard': [[{'text': label, 'callback_data': data} for label, data in row]
+                                        for row in markup]}
+        return None
+
+    def formatted(self, method, params, text):
+        """Send model Markdown as Telegram HTML; if Telegram rejects the markup, resend as plain text."""
+        try:
+            return self.call(method, **params, text=to_html(text), parse_mode='HTML')
+        except TelegramFailure as error:
+            if error.code != 400 or error.not_modified:
+                raise
+            event('delivery_failed', level=logging.WARNING, status_code=400, reason='formatting_rejected')
+            return self.call(method, **params, text=text)
+
+    def send(self, job, text, markup=None, force_reply=None):
+        params = dict(chat_id=job['chat_id'],
+            reply_parameters={'message_id': job['message_id'], 'allow_sending_without_reply': True},
             link_preview_options={'is_disabled': True})
         if job.get('thread_id'):
             params['message_thread_id'] = job['thread_id']
-        return self.call('sendMessage', **params)
+        reply_markup = self.reply_markup(markup, force_reply)
+        if reply_markup:
+            params['reply_markup'] = reply_markup
+        return self.formatted('sendMessage', params, text)
+
+    def edit(self, chat_id, message_id, text, markup=None):
+        """Edit a bot message in place; identical content counts as success."""
+        params = dict(chat_id=chat_id, message_id=message_id, link_preview_options={'is_disabled': True},
+                      reply_markup=self.reply_markup(markup) or {'inline_keyboard': []})
+        try:
+            return self.formatted('editMessageText', params, text)
+        except TelegramFailure as error:
+            if error.not_modified:
+                return {'message_id': message_id}
+            raise
+
+    def clear_buttons(self, chat_id, message_id):
+        try:
+            return self.call('editMessageReplyMarkup', chat_id=chat_id, message_id=message_id,
+                             reply_markup={'inline_keyboard': []})
+        except TelegramFailure as error:
+            if error.not_modified:
+                return None
+            raise
+
+    def answer_callback(self, callback_id, text=None):
+        params = {'callback_query_id': callback_id}
+        if text:
+            params['text'] = text[:200]
+        return self.call('answerCallbackQuery', **params)
+
+    def set_commands(self, public, admin):
+        """Russian command menu: everyone in groups, more for group admins."""
+        # Default scope too: clients fall back to it, and it covers chats with the bot itself.
+        for scope, commands in (({'type': 'default'}, public), ({'type': 'all_group_chats'}, public),
+                                ({'type': 'all_chat_administrators'}, admin)):
+            self.call('setMyCommands', scope=scope,
+                      commands=[{'command': name, 'description': description} for name, description in commands])
 
     def is_admin(self, job):
         """True/False when known; None when Telegram could not be asked."""

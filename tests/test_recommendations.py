@@ -53,11 +53,11 @@ class RenderTests(unittest.TestCase):
         text, dropped, _ = rec.render(answer([
             item(links=['https://afisha.yandex.ru/moscow/musical/mamma-mimo/#schedule', 'https://invented.example/x']),
             item(name='Без ссылки', links=['https://invented.example/y'])]), evidence)
-        self.assertIn('1. 🎭 Мамма мимо — Театр на Цветном', text)
+        self.assertIn('1. 🎭 **Мамма мимо** — Театр на Цветном', text)
         self.assertIn('📅 13 октября, 19:00 · 💳 от 1 500 ₽', text)
         self.assertIn('🔗 https://afisha.yandex.ru/moscow/musical/mamma-mimo', text)
         self.assertNotIn('invented', text)
-        self.assertIn('2. 🎭 Без ссылки', text)
+        self.assertIn('2. 🎭 **Без ссылки**', text)
         self.assertIn('🔗 —', text)
         self.assertEqual(dropped, 2)
 
@@ -109,7 +109,7 @@ class StructuredFlowTests(unittest.TestCase):
         with patch.object(model, '_generation_attempt', side_effect=self.flow(
                 cards('Cafe', 'https://example.com/cafe'))) as generate, patch('model.event') as log:
             text = model.generate('Persona', [{'role': 'user', 'content': 'куда сходить?'}], allow_search=True)
-        self.assertIn('1. ☕ Cafe', text)
+        self.assertIn('1. ☕ **Cafe**', text)
         self.assertIn('🔗 https://example.com/cafe', text)
         self.assertNotIn('Sources:', text)
         second = generate.call_args_list[1]

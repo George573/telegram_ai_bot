@@ -163,7 +163,7 @@ def render(value, evidence, max_chars=3500, excluded_names=()):
                 links.append(url)
             else:
                 dropped += 1
-        head = f"{index}. {ICONS[item['kind']]} {clean(item['name'])}"
+        head = f"{index}. {ICONS[item['kind']]} **{clean(item['name']).replace('*', '')}**"
         if item['venue']:
             head += ' — ' + clean(item['venue'])
         lines = [head]

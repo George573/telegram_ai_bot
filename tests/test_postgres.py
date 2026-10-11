@@ -17,7 +17,7 @@ class PostgresTests(unittest.TestCase):
     def setUp(self):
         self.conn=psycopg.connect('host=db dbname=roleplay user=roleplay password=test-only-password',autocommit=True,row_factory=dict_row)
         self.store=Store(50,self.conn)
-        self.conn.execute('TRUNCATE messages, chats, jobs, rate_limits CASCADE')
+        self.conn.execute('TRUNCATE messages, chats, jobs, rate_limits, prompts CASCADE')
         self.conn.execute('UPDATE runtime SET next_update=0,spent=0')
     def tearDown(self): self.conn.close()
     def test_atomic_checkpoint_and_deduplication(self):
@@ -299,6 +299,39 @@ class PostgresTests(unittest.TestCase):
         self.conn.execute("UPDATE jobs SET created_at=now()-interval '2 days'")
         self.assertIsNone(self.store.next_job(-1))
         self.assertIsNotNone(self.store.job(2))
+
+    def test_prompts_are_single_use_scoped_and_expire(self):
+        self.store.state(-1)
+        self.store.save_prompt(-1, 500, 10, '/historylimit')
+        self.store.save_prompt(-1, 501, 10, 'skill', 'city-events')
+        self.assertEqual(self.store.prompt(-1, 500), {'user_id': 10, 'command': '/historylimit', 'skill': None})
+        self.assertEqual(self.store.prompt(-1, 501)['skill'], 'city-events')
+        self.assertIsNone(self.store.prompt(-2, 500))
+        self.store.delete_prompt(-1, 500)
+        self.assertIsNone(self.store.prompt(-1, 500))
+        self.conn.execute("UPDATE prompts SET expires_at=now()-interval '1 minute' WHERE message_id=501")
+        self.assertIsNone(self.store.prompt(-1, 501))
+        self.store.maintenance()
+        self.assertEqual(self.conn.execute('SELECT count(*) AS n FROM prompts').fetchone()['n'], 0)
+
+    def test_forgetme_removes_the_users_prompts(self):
+        self.store.state(-1)
+        self.store.save_prompt(-1, 500, 10, '/chat')
+        self.store.save_prompt(-1, 501, 11, '/chat')
+        self.store.forget_user(-1, 10, 2)
+        self.assertIsNone(self.store.prompt(-1, 500))
+        self.assertIsNotNone(self.store.prompt(-1, 501))
+
+    def test_job_buttons_prompt_and_status_message_round_trip(self):
+        self.store.enqueue(1, {'chat_id': -1})
+        markup = [[['✅ Да', 'v1:confirm:yes'], ['✖️ Нет', 'v1:confirm:no']]]
+        self.store.phase(1, 'generated', 'Точно?', False, markup=markup, reply_prompt='confirm:/forgetme')
+        self.store.set_status_message(1, 777)
+        job = self.store.job(1)
+        self.assertEqual((job['markup'], job['reply_prompt'], job['status_message_id']),
+                         (markup, 'confirm:/forgetme', 777))
+        self.store.phase(1, 'sending', 'Точно?', False)
+        self.assertIsNone(self.store.job(1)['markup'])
 
     def test_drafts_persist_scope_and_expire_without_changing_character(self):
         from personality import DEFAULTS

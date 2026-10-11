@@ -21,7 +21,8 @@ def _path(name):
 
 
 @lru_cache(maxsize=len(SKILL_NAMES))
-def metadata(name):
+def fields(name):
+    """Frontmatter fields of a bundled skill."""
     with _path(name).open(encoding='utf-8') as source:
         if source.readline().strip() != '---':
             raise ValueError('Invalid bundled skill metadata')
@@ -36,7 +37,23 @@ def metadata(name):
             raise ValueError('Invalid bundled skill metadata')
     if fields.get('name') != name or not fields.get('description'):
         raise ValueError('Invalid bundled skill metadata')
-    return fields['description']
+    return fields
+
+
+def metadata(name):
+    return fields(name)['description']
+
+
+def title(name):
+    """Short Russian label for menus (frontmatter title, else the name)."""
+    return fields(name).get('title') or name
+
+
+def summary(name):
+    """Short scope of the skill for the /skills list: the description up to its first colon or sentence end."""
+    description = fields(name)['description']
+    return description.split(':')[0].split('. ')[0].rstrip('.')
+
 
 
 def catalog():

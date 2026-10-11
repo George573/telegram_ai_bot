@@ -116,7 +116,7 @@ class ReviewFixTests(unittest.TestCase):
     def test_status_shows_automatic_search(self):
         service = self.setup_service()
         self.store.chat['web_enabled'] = True
-        self.assertIn('web: True (automatic in conversation)', service.status(-1))
+        self.assertIn('Поиск: вкл', service.status(-1))
 
     def test_pause_takes_effect_before_previous_reply_finishes(self):
         service = self.setup_service()

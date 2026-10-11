@@ -215,10 +215,10 @@ class ProviderTests(unittest.TestCase):
         store, telegram = MemoryStore(), FakeTelegram(admin=True)
         service = Service(self.config(), store, telegram, FakeModel())
         status = service.status(-1)
-        self.assertIn('provider: zai', status)
-        self.assertIn('voice limit: 30s', status)
+        self.assertIn('Провайдер: zai', status)
+        self.assertIn('Голосовые до 30 с', status)
+        self.assertIn('Фото: вкл · Голосовые: вкл · Поиск: выкл', status)
         for feature in ['images', 'voice', 'web']:
-            self.assertIn(feature + (': False' if feature == 'web' else ': True'), status)
             store.enqueue(1, payload('/' + feature + ' on'))
             service.command(store.next_job())
             self.assertTrue(store.chat[feature + '_enabled'])

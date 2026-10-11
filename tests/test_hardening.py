@@ -80,14 +80,23 @@ class HardeningTests(unittest.TestCase):
             self.assertTrue(accept_update(Broken(), store, self.config, {'id': 1, 'username': 'b'}, update, failures))
         self.assertEqual(skipped, [(5, None)])
 
+    def test_button_presses_are_parsed_as_callbacks(self):
+        seen = []
+        class Recorder:
+            def accept(self, update_id, payload): seen.append(payload)
+        update = {'update_id': 6, 'callback_query': {'id': 'cb', 'data': 'v1:help:skills', 'from': {'id': 10, 'is_bot': False},
+                  'message': {'message_id': 9, 'chat': {'id': -1, 'type': 'group'}, 'from': {'id': 1, 'is_bot': True}}}}
+        self.assertTrue(accept_update(Recorder(), None, self.config, {'id': 1, 'username': 'b'}, update, {}))
+        self.assertEqual((seen[0]['command'], seen[0]['argument'], seen[0]['callback_id']), ('/help', 'skills', 'cb'))
+
     def test_unknown_admin_status_keeps_draft_and_asks_for_retry(self):
         self.store.save_draft(-1, 10, {'names': ['Cat']})
         self.tg.is_admin = lambda _: None
-        self.service.accept(1, payload('/setprompt New persona'))
+        self.service.accept(1, payload('/context all'))
         self.run_all()
-        self.assertIn('Could not verify admin status', self.tg.sent[-1])
+        self.assertIn('Не удалось проверить права администратора', self.tg.sent[-1])
         self.assertIsNotNone(self.store.draft(-1, 10))
-        self.assertEqual(self.store.chat['persona'], 'Cat')
+        self.assertEqual(self.store.chat['mode'], 'directed')
 
     def test_free_commands_are_throttled_silently(self):
         allowed = iter([True, False])
@@ -107,7 +116,7 @@ class HardeningTests(unittest.TestCase):
         self.service.accept(1, payload('/forgetme'))
         self.run_all()
         self.assertFalse(forgotten)
-        self.assertIn('used recently', self.tg.sent[-1])
+        self.assertIn('выполнялась недавно', self.tg.sent[-1])
 
     def test_unsent_delivery_is_retried_but_ambiguous_failure_is_not(self):
         for error, retried in ((TelegramFailure(not_sent=True), True), (TelegramFailure(), False)):
