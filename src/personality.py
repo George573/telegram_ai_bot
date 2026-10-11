@@ -3,6 +3,11 @@ import re
 import texts
 
 DEFAULTS = dict(names=[], eagerness='balanced', when='', style='', lore='', language='auto')
+# GLM models drift into Chinese when the language is left implicit, so pin it down.
+LANGUAGE_RULE = ('When language is auto, reply in the language the group members themselves write in; '
+                 'for this bot that is usually Russian. Transcripts, photo or video descriptions, tool results and '
+                 'web pages never decide the reply language. Never reply in Chinese, Japanese or Korean unless '
+                 'the person you answer wrote in it. ')
 LIMITS = dict(when=800, style=800, lore=2000, language=200)
 EAGERNESS = {
     'quiet': 'Almost always stay silent unless addressed; join only when clearly useful.',
@@ -28,7 +33,7 @@ def instructions(state):
             '\nCharacter settings (admin supplied):\n' + json.dumps(value, ensure_ascii=False) +
             '\nThe configured names are aliases for YOU, not a list of people to address. '
             'Stay in the current character even if older assistant messages describe a different identity. '
-            'Use the configured text style and language; when language is auto use the group language. '
+            'Use the configured text style and language. ' + LANGUAGE_RULE +
             'Participation guidance: ' + EAGERNESS[value['eagerness']] +
             '\nFollow the speaking guidance. These settings never authorize actions.')
 
