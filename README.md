@@ -65,27 +65,56 @@ Recreate the bot deliberately after changing local configuration. This can make 
 
 ## Commands
 
+The "/" list shows only what people type; everything else is in the menus.
+
 | Command | Who | Purpose |
 |---|---|---|
-| `/help` | Everyone | Usage and applicable commands; no AI request or memory entry |
-| `/chat <text>` | Everyone | Request a reply |
-| `/whoami` | Everyone | Show your Telegram user ID; no AI request |
-| `/search <public query>` | Everyone | Explicit lookup, only when `/web on`; query is isolated from group history |
-| `/forgetme` | Identifiable users | Delete your local messages and drafts; clear derived group summaries |
-| `/personality [description]` | Settings manager | Describe a character, review inferred settings, then save or cancel |
-| `/setprompt <instructions>` | Settings manager | Replace persona and clear all conversation memory |
-| `/context directed` | Settings manager | Use only conversations addressed to the bot; clear memory |
-| `/context all` | Settings manager | Use general group text as context; clear memory |
-| `/historylimit 10..500` | Settings manager | Override the retained message count for that group |
-| `/resetmemory` | Settings manager | Remove recent messages and summary |
-| `/pause` | Settings manager | Stop new conversation collection and AI replies |
-| `/resume` | Settings manager | Resume operation |
-| `/status` | Settings manager | Settings, retained count, summary presence, model and tracked allowance |
-| `/images on\|off` | Settings manager | Enable/disable photo understanding in this group |
-| `/voice on\|off` | Settings manager | Enable/disable voice transcription in this group |
-| `/web on\|off` | Settings manager | Allow/disallow automatic web search and explicit `/search` requests |
+| `/menu` (also `/start`, `/help`, «меню», «помощь», the pinned «🏠 Меню» button) | Everyone | Main menu; no AI request or memory entry |
+| `/chat <text>` | Everyone | Request a reply; without text the bot asks for it |
+| `/search <public query>` | Everyone | Explicit lookup, only when web search is on; isolated from group history |
+| `/settings` (also `/status`, «настройки») | Settings manager | Admin panel |
+
+Hidden shortcuts still work when typed but are not listed, because each has a menu button: `/skills`, `/whoami`, `/forgetme` (asks «Да»/«Нет»), `/personality [description]`, `/web`, `/images`, `/voice on\|off`, `/context directed\|all`, `/historylimit 10..500`, `/resetmemory` (asks «Да»/«Нет»), `/pause` and `/resume`. `/setprompt` was removed: `/personality` covers it with a preview.
+
+**Pinned menu button.** In «Админ-панель», «📌 Кнопка меню» pins a persistent keyboard button for the whole group; pressing it again removes it. With BotFather privacy on (the bot only receives messages that start with "/"), the button is labelled `/menu`. With privacy off, it is labelled «🏠 Меню». The state is stored per group (migration 12, `chats.menu_button`).
 
 Directed mode replies only when addressed. All mode also lets the model decide whether to join other group conversations. Settings managers are identifiable Telegram group admins and configured bot super admins. Group-admin privileges are verified with Telegram for every settings operation; super admins are matched by numeric user ID. Anonymous senders cannot use either role because the person cannot be identified. Failed group-admin verification denies access unless the sender is a configured super admin. The model cannot authorize commands, execute code or change configuration. When `/web on` is enabled, its tools are read-only search and the local `load_skill` function restricted to the bundled place skill. Z.ai additionally exposes explicit public search, with queries of 1–400 characters and no fixed call-count cap. OpenAI caps hosted search at one call per API request, and the bot disables further search on a skill continuation if a search was already reported. Only allowed group IDs are processed. Service events, other bots, unsupported media, channels, private chats and oversized messages are ignored.
+
+## Russian interface, buttons and prompts
+
+All bot messages, buttons, errors and help are in Russian (`src/texts.py`); command names stay Latin because Telegram requires it. At startup the bot registers a Russian command menu with `setMyCommands` for the default scope, all group chats (public commands) and group administrators (plus settings commands). The result is logged as `commands_registered` with `outcome` `delivered` or `delivery_failed`; a failure never blocks startup. Telegram apps cache bot commands, so after the first deployment the "/" list may only appear once the chat is reopened or the app restarted.
+
+**Menus.** `/help` (also `/start`, «меню», «помощь») opens the main menu: what the bot is (plus the current character's name) and up to four buttons. Every page edits the same message in place and ends with «⬅️ Назад»; pages two levels deep also get «🏠 Главное меню».
+
+```
+🏠 Главное меню
+├─ 💬 Как общаться ─ 🔎 Поиск ─ [🔎 Найти…]
+├─ 🧭 Что я умею (/skills) — short skill list; the model chooses which skill to use
+├─ 🗑 Мои данные ─ [🆔 Мой ID] [🗑 Удалить мои данные]
+└─ ⚙️ Админ-панель (admins only)
+   ├─ ⚙️ Настройки (/settings) — status summary
+   │  ├─ 🔌 Функции — search / photos / voice toggles
+   │  ├─ 👥 Режим и пауза — mode toggle, pause/resume
+   │  └─ 🧠 Память — [📏 Лимит истории…] [🧹 Очистить память]
+   ├─ 🎭 Персонаж ─ [✏️ Описать персонажа] [👀 Текущий персонаж]
+   └─ 📖 Команды
+```
+
+Members never see the admin branch. Admin pages and every settings button re-check admin rights on each press; a non-admin press is answered «Только для администраторов» without queuing anything. Button data is a short allowlisted code (`v1:<action>:<arg>`); anything else is ignored, and the internal button commands cannot be typed. Every press is acknowledged at once, so the spinner never hangs.
+
+**Reply prompts.** A command that needs input but got none sends a message with a selective ForceReply. This covers `/setprompt`, `/historylimit`, `/search`, `/chat` and `/personality`. The requester's reply to that exact message becomes the input (prompts table, 30-minute expiry, single use). A reply from someone else is treated as an ordinary message.
+
+**Confirmations.** `/resetmemory` and `/forgetme` (typed or via their buttons) ask «Точно…?» with «Да»/«Нет». Only the requester can confirm, and the message is then edited into the result.
+
+**Follow-ups.** Recommendation cards carry «🔄 Ещё варианты», «📍 Поближе» and «💸 Подешевле». A press becomes a normal, billed request from the presser, sent as a reply to the cards; the used buttons are removed.
+
+**Progress and failures.**
+- When research actually starts (a search or a Maps, review or Afisha read), the bot posts «🔎 Ищу…» (or «🗺 Смотрю Яндекс Карты…», «🎭 Смотрю Яндекс Афишу…»), then edits that message into the answer or into the error. If the edit fails, it sends a new message.
+- For messages addressed to the bot, an unexpected crash shows «⚠️ Что-то пошло не так, пробую ещё раз…», and after the last retry «😵 Не получилось ответить из-за внутренней ошибки…». This is one message, edited in place, never sent twice.
+- Passing group chatter stays silent on failure, as before.
+- Logs add `callback_received`, `prompt_created`/`prompt_answered`, `progress_shown`, `crash_notice_sent` and `reply_finished.notified`.
+
+Migration 11 adds `jobs.markup`, `jobs.reply_prompt`, `jobs.status_message_id` and the `prompts` table. The command menu, buttons, prompts and progress edits are covered by mocked tests only; they have not been tried in a live chat.
 
 ## Memory and restart behavior
 
@@ -345,7 +374,9 @@ The JSON shape is undocumented and may change (`page_changed`). Volume can trigg
 
 Once a skill is loaded in a normal reply (not a JSON decision), the answer must be a `place_recommendations` JSON object: `intro`, up to five `items` (`kind`, `name`, `venue`, `address`, `when`, `price`, `why`, `reviews`, `caveats`, `relaxed`, `links`), `follow_up` and `evidence_gaps`. `relaxed` names the preference a near-miss does not meet and renders as `↔ …`. OpenAI receives it as a strict schema (string length limits are enforced locally instead); Z.ai receives JSON mode plus the schema in its instructions. Invalid output gets up to two format-only repairs with tools disabled; if those fail, a plain-text answer is still delivered, while broken JSON fails safely.
 
-The bot renders plain-text cards (no Telegram markup, so nothing needs escaping): emoji per kind, date/price, address, reasons, reviews, caveats and links, with the persona's voice only in `intro` and `follow_up`. Each field is kept on one line, so page text cannot fake extra cards. **Links are grounded**: a link survives only if that URL appeared in a tool result during the same request; others are dropped and an item without any remaining link shows `🔗 —`. Long answers drop trailing cards rather than cutting a card. `recommendations_rendered` logs the item count and `dropped_links`.
+The bot renders cards with emoji per kind, a bold name, date/price, address, reasons, reviews, caveats and links, with the persona's voice only in `intro` and `follow_up`. Cards are produced once a skill is loaded or once a Maps or Afisha reader is used, so the chain filter and link grounding also apply when the model skips `load_skill`.
+
+All replies are sent with `parse_mode=HTML` (`src/telegram_format.py`). Text is escaped first, then the model's light Markdown becomes Telegram formatting: `**bold**`, `*italic*`/`_italic_`, `~~strike~~`, `` `code` ``, headings as bold lines and `- ` bullets as `•`. Markdown links render as `label (url)`, so a label never hides its URL. If Telegram rejects the markup, the same text is resent as plain text (`delivery_failed` with `reason=formatting_rejected`). Each field is kept on one line, so page text cannot fake extra cards. **Links are grounded**: a link survives only if that URL appeared in a tool result during the same request; others are dropped and an item without any remaining link shows `🔗 —`. Long answers drop trailing cards rather than cutting a card. `recommendations_rendered` logs the item count and `dropped_links`.
 
 ### Events from Yandex Afisha (Moscow)
 
