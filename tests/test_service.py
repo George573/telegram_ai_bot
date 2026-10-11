@@ -115,7 +115,7 @@ class FakeModel:
     def decide_reply(self, instructions, history, **kwargs):
         self.generate(instructions, history)
         return None
-    def describe_image(self, data):
+    def describe_image(self, data, frames=0):
         self.calls.append(('Describe image', len(data)))
         if self.fail: raise ModelFailure()
         return 'A cat sitting on a sofa'

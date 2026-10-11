@@ -316,9 +316,10 @@ class OpenAIProvider:
     def skill_result(self, call, text):
         return {'type': 'function_call_output', 'call_id': call.call_id, 'output': text}
 
-    def transcribe(self, wav):
+    def transcribe(self, wav, prompt=None):
+        extra = {'prompt': prompt} if prompt else {}
         return self.client.audio.transcriptions.create(model='gpt-transcribe',
-            file=('voice.wav', wav, 'audio/wav'), response_format='json').text
+            file=('voice.wav', wav, 'audio/wav'), response_format='json', **extra).text
 
 
 class ZaiProvider:
@@ -431,9 +432,11 @@ class ZaiProvider:
                 results.append(result)
         return SearchOutcome(results, filters_applied=applied or not filters)
 
-    def transcribe(self, wav):
+    def transcribe(self, wav, prompt=None):
+        # The previous piece's text gives the next one context (names, continuity).
+        body = {'stream': False, **({'prompt': prompt} if prompt else {})}
         return self.client.audio.transcriptions.create(model='glm-asr-2512',
-            file=('voice.wav', wav, 'audio/wav'), extra_body={'stream': False}).text
+            file=('voice.wav', wav, 'audio/wav'), extra_body=body).text
 
 
 def create_provider(config, client=None):

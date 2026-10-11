@@ -216,7 +216,7 @@ class ProviderTests(unittest.TestCase):
         service = Service(self.config(), store, telegram, FakeModel())
         status = service.status(-1)
         self.assertIn('Провайдер: zai', status)
-        self.assertIn('Голосовые до 30 с', status)
+        self.assertIn('Голосовые до 120 с', status)  # Longer than Z.ai's 30 s: audio is split into pieces.
         self.assertIn('Фото: вкл · Голосовые: вкл · Поиск: выкл', status)
         for feature in ['images', 'voice', 'web']:
             store.enqueue(1, payload('/' + feature + ' on'))
@@ -224,14 +224,14 @@ class ProviderTests(unittest.TestCase):
             self.assertTrue(store.chat[feature + '_enabled'])
             store.finish(1)
 
-    def test_service_rejects_overlong_zai_voice_before_telegram_download(self):
-        for kind in ['voice']:
+    def test_service_rejects_audio_beyond_voice_max_seconds_before_download(self):
+        for kind in ['voice', 'video_note']:
             store, telegram = MemoryStore(), FakeTelegram()
             telegram.download = lambda *_: self.fail('Unsupported media must not download')
             model = FakeModel()
             service = Service(self.config(), store, telegram, model)
             message = payload()
-            message['media'] = {'kind': kind, 'file_id': 'synthetic', 'bytes': 10, 'seconds': 31}
+            message['media'] = {'kind': kind, 'file_id': 'synthetic', 'bytes': 10, 'seconds': 121}
             store.enqueue(1, message)
             service.prepare(store.next_job())
             self.assertEqual(store.next_job()['phase'], 'generated')
@@ -369,15 +369,21 @@ class ProviderTests(unittest.TestCase):
         service.prepare(store.next_job())
         self.assertIn('A cat', store.rows[0]['content'])
 
-    def test_service_uses_zai_voice_duration_limit_for_decoded_audio(self):
+    def test_long_zai_voice_is_split_into_pieces_under_the_30_second_limit(self):
         store, telegram = MemoryStore(), FakeTelegram()
-        service = Service(self.config(), store, telegram, FakeModel())
+        model = FakeModel()
+        pieces = []
+        model.transcribe = lambda audio, seconds: pieces.extend(audio) or 'Длинное сообщение'
+        service = Service(self.config(), store, telegram, model)
         message = payload()
-        message['media'] = {'kind': 'voice', 'file_id': 'synthetic', 'bytes': 10, 'seconds': 10}
+        message['media'] = {'kind': 'voice', 'file_id': 'synthetic', 'bytes': 10, 'seconds': 70}
         store.enqueue(1, message)
-        with patch('service.voice_wav', return_value=(b'synthetic-wav', 10)) as decode:
+        with patch('service.voice_pcm', return_value=(b'\x01\x00' * 16000 * 70, 70)) as decode:
             service.prepare(store.next_job())
-        self.assertEqual(decode.call_args.args[1], 30)
+        self.assertEqual(decode.call_args.args[1], 120)
+        self.assertEqual(len(pieces), 3)
+        self.assertTrue(all(seconds <= 28 for _, seconds in pieces))
+        self.assertAlmostEqual(sum(seconds for _, seconds in pieces), 70, places=3)
         self.assertIn('Voice transcript', store.next_job()['payload']['text'])
 
     def test_paid_text_model_uses_native_api_and_correct_costs(self):

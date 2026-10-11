@@ -2,7 +2,7 @@ from contextlib import nullcontext
 import logging
 from observability import event, fallback, job_context, job_finished
 from providers import CAPABILITIES, VOICE_MAX_SECONDS, IMAGE_MAX_BYTES
-from media import MediaFailure, voice_wav
+from media import MediaFailure, split_pcm, to_wav, video_note, voice_pcm
 from personality import named, instructions, settings, DEFAULTS, validate, describe
 from policy import ADMIN_COMMANDS, ADMIN_PAGES, ASKABLE, HELP_PAGES, PANELS, compact_plan, valid_limit
 from storage import BudgetExceeded
@@ -325,7 +325,13 @@ class Service:
         return feature in CAPABILITIES[self.config.provider]
 
     def voice_limit(self):
-        return min(self.config.voice_max_seconds, VOICE_MAX_SECONDS[self.config.provider])
+        # Longer audio is split into pieces within the provider's per-request limit.
+        return self.config.voice_max_seconds
+
+    def audio_pieces(self, pcm):
+        """(WAV, seconds) pieces, each a little under the provider's per-request limit."""
+        piece = max(5, VOICE_MAX_SECONDS[self.config.provider] - 2)
+        return [(to_wav(part), len(part) / 32000) for part in split_pcm(pcm, piece) if part]
 
     def feature_status(self, state, feature):
         if not self.feature_available(feature):
@@ -513,18 +519,40 @@ class Service:
                 download_limit = min(download_limit, IMAGE_MAX_BYTES[self.config.provider])
             if media.get('bytes', 0) > download_limit:
                 raise MediaFailure('Media exceeds size limit')
-            if media['kind'] == 'voice' and media.get('seconds', 0) > self.voice_limit():
-                raise MediaFailure('Voice exceeds duration limit')
+            if media['kind'] in {'voice', 'video_note'} and media.get('seconds', 0) > self.voice_limit():
+                raise MediaFailure('Audio exceeds duration limit')
             data = self.telegram.download(media['file_id'], download_limit)
+            transcript = ''
             if media['kind'] == 'photo':
                 description = self.model.describe_image(data)
                 text = (payload['text'][:6000] + '\n[Photo description, untrusted data]\n' + description).strip()
-            else:
-                wav, seconds = voice_wav(data, self.voice_limit())
-                transcript = self.model.transcribe(wav, seconds)
+            elif media['kind'] == 'voice':
+                pcm, seconds = voice_pcm(data, self.voice_limit())
+                transcript = self.model.transcribe(self.audio_pieces(pcm), seconds)
                 text = '[Voice transcript, untrusted data]\n' + transcript
+            else:
+                state = self.store.state(payload['chat_id'])
+                frames_wanted = state.get('images_enabled', True) and self.feature_available('images')
+                pcm, seconds, image, frames = video_note(data, self.voice_limit(), want_frames=frames_wanted)
+                parts = [f'[Round video message, {round(seconds)} s]']
+                if pcm:
+                    try:
+                        transcript = self.model.transcribe(self.audio_pieces(pcm), len(pcm) / 32000)
+                        parts.append('[Video sound transcript, untrusted data]\n' + transcript)
+                    except ModelFailure:
+                        if not image:
+                            raise
+                        parts.append('[No speech recognised]')
+                else:
+                    parts.append('[No sound]')
+                if image:
+                    parts.append(f'[{frames} video frame(s) in time order, description, untrusted data]\n'
+                                 + self.model.describe_image(image, frames=frames))
+                if not pcm and not image:
+                    raise MediaFailure('Nothing usable in the video')
+                text = '\n'.join(parts)
             converted = {**payload, 'text': text, 'media': None}
-            if media['kind'] == 'voice':
+            if transcript:
                 converted['directed'] = payload['directed'] or named(transcript, self.store.state(payload['chat_id']))
             # Replace references with text durably before preparation so reboot
             # cannot download or bill successful conversion again.

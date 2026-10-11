@@ -72,7 +72,7 @@ class MediaServiceTests(unittest.TestCase):
     def test_transcript_is_data_not_command_and_spoken_name_directs_in_all_mode(self):
         self.store.chat['mode'] = 'all'
         self.store.chat['personality'] = {'names': ['Армен']}
-        with patch('service.voice_wav', return_value=(b'fake wav', 10)):
+        with patch('service.voice_pcm', return_value=(b'\x00\x00' * 16000 * 10, 10)):
             self.run_job(update('voice'))
         self.assertEqual(self.store.chat['persona'], 'Cat')
         self.assertIn('[Voice transcript, untrusted data]', self.store.rows[0]['content'])

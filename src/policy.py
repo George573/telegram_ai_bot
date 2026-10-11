@@ -60,10 +60,17 @@ def normalize(update, allowed, bot):
             return None
         media = dict(kind='voice', file_id=voice['file_id'], bytes=voice.get('file_size', 0),
                      seconds=voice.get('duration', 0))
+    elif message.get('video_note'):
+        # Round video message: its sound is transcribed like voice, plus 1–3 frames when photos are on.
+        circle = message['video_note']
+        if not isinstance(circle, dict) or not isinstance(circle.get('file_id'), str) or not 0 < len(circle['file_id']) <= 1024:
+            return None
+        media = dict(kind='video_note', file_id=circle['file_id'], bytes=circle.get('file_size', 0),
+                     seconds=circle.get('duration', 0))
     if chat.get('id') not in allowed or chat.get('type') not in {'group', 'supergroup'} or sender.get('is_bot'):
         return None
     if media and (type(media['bytes']) is not int or media['bytes'] < 0 or
-                  (media['kind'] == 'voice' and (type(media['seconds']) is not int or media['seconds'] < 0))):
+                  (media['kind'] in {'voice', 'video_note'} and (type(media['seconds']) is not int or media['seconds'] < 0))):
         return None
     if not isinstance(text, str) or (not media and not text.strip()) or len(text) > 8000:
         return None

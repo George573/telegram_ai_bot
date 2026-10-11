@@ -53,7 +53,7 @@ Z.ai supports text, photos and voice notes. Text requests, including summaries a
 
 For photos, the paid default is `glm-4.6v`: $0.30 input / $0.90 output per million tokens. Lower-cost alternatives are `glm-4.6v-flashx` ($0.04 / $0.40) and `glm-4.6v-flash` (currently free). The adapter sends a JPEG as an in-memory Base64 image, capped at 5 MiB or your smaller media limit. It never sends Telegram download URLs. Reservations and reconciled usage use the **vision model's rates**, independently of the text model. [Vision models](https://docs.z.ai/guides/vlm/glm-4.6v), [pricing](https://docs.z.ai/guides/overview/pricing).
 
-Voice uses Z.ai's `glm-asr-2512` transcription endpoint with the same Z.ai key. Telegram OGG audio is decoded to mono WAV in memory. Z.ai accepts at most **30 seconds**, so the effective limit is the smaller of 30 and `VOICE_MAX_SECONDS`. Longer notes are rejected, not truncated or split. Both Telegram metadata and decoded audio duration are checked before upload. The local reservation uses Z.ai's published approximate $0.0024/minute equivalent, plus one second and a 25% allowance; actual provider billing is token-based ($0.03 per million tokens), so this is an estimate, not invoice reconciliation. Failed requests keep their reservations. [Audio API](https://docs.z.ai/api-reference/audio/audio-transcriptions), [pricing](https://docs.z.ai/guides/overview/pricing).
+Voice uses Z.ai's `glm-asr-2512` transcription endpoint with the same Z.ai key. Telegram OGG audio is decoded to mono WAV in memory. Z.ai accepts at most **30 seconds per request**, so longer messages are split into pieces of up to 28 seconds. Each cut falls at the quietest 100 ms near the boundary, and each piece receives the previous piece's text as context (`prompt`). The pieces are transcribed in order and joined. `VOICE_MAX_SECONDS` (default 120, maximum 300) is the only overall length limit. Each piece is a separate request, reserved and charged separately. OpenAI pieces may be up to 298 seconds. Both Telegram metadata and decoded audio duration are checked before upload. The local reservation uses Z.ai's published approximate $0.0024/minute equivalent, plus one second and a 25% allowance; actual provider billing is token-based ($0.03 per million tokens), so this is an estimate, not invoice reconciliation. Failed requests keep their reservations. [Audio API](https://docs.z.ai/api-reference/audio/audio-transcriptions), [pricing](https://docs.z.ai/guides/overview/pricing).
 
 With Z.ai selected, `/images` and `/voice` work normally. `/status` shows the vision model and effective voice limit. When `/web on` is enabled, ordinary replies and explicit `/search` requests use the provider-neutral `search_web` function (see "Structured search" below); `/web on|off` controls permission per group. On Z.ai it calls the configured `/web_search` endpoint (`search-prime`, five results) and returns bounded evidence snippets and validated links. [Explicit API](https://docs.z.ai/api-reference/tools/web-search). Text, selected media and stored summaries are sent to whichever provider you explicitly select; review its data policies and tell group members before switching.
 
@@ -262,6 +262,15 @@ Settings and drafts are stored in local PostgreSQL through automatic additive mi
 
 If an older version replied with the wrong character, use `/resetmemory` after updating to remove that reply from context. The saved personality remains intact. The current character identity also takes precedence over conflicting identities in past conversation. Telegram delivery rules are documented under [privacy mode](https://core.telegram.org/bots/features#privacy-mode).
 
+
+## Video circles
+
+Telegram round video messages (`video_note`) are understood when voice is enabled in the group (`/voice on`):
+- **Sound:** extracted with ffmpeg and transcribed like a voice message, split into pieces when longer than the provider allows.
+- **Frames:** when photos are also enabled, 1 frame (up to 15 s), 2 frames (up to 40 s) or 3 frames (longer) are taken at even intervals. They are tiled left to right in time order into one 320-pixel-high JPEG and described in a single vision request.
+- **Memory:** both results enter memory as untrusted text, labelled with the circle's length.
+
+A circle without sound still gets its frames described, and a spoken character name in a circle addresses the bot, just as in voice messages. Because MP4 metadata can sit at the end of the file, the circle is decoded from one private temporary file (mode 0600) in the container's in-memory `/tmp`, deleted right after. `MEDIA_MAX_BYTES` (default 5 MiB) also applies to circles; long, high-quality circles can exceed it.
 
 ## Photos, voice and web search
 
