@@ -4,9 +4,10 @@ from observability import event, fallback, job_context, job_finished
 from providers import CAPABILITIES, VOICE_MAX_SECONDS, IMAGE_MAX_BYTES
 from media import MediaFailure, split_pcm, to_wav, video_note, voice_pcm
 from personality import named, instructions, settings, DEFAULTS, validate, describe
-from policy import ADMIN_COMMANDS, ADMIN_PAGES, ASKABLE, HELP_PAGES, PANELS, compact_plan, valid_limit
+from policy import ADMIN_COMMANDS, ADMIN_PAGES, ASKABLE, HELP_PAGES, PANELS, compact_plan, memory_view, valid_limit
 from storage import BudgetExceeded
 from model import ModelFailure
+from chat_actions import ChatActions
 from telegram_api import TelegramFailure
 import skill_registry
 import texts
@@ -681,6 +682,14 @@ class Service:
         b = texts.BUTTONS
         return buttons([(b['more'], 'v1:more:more')], [(b['closer'], 'v1:more:closer'), (b['cheaper'], 'v1:more:cheaper')])
 
+    def actions(self, job):
+        """Polls and scheduled messages for a request addressed to the bot; never for incidental replies."""
+        payload = job['payload']
+        if not hasattr(self.store, 'schedule') or not hasattr(self.telegram, 'send_poll'):
+            return None
+        return ChatActions(self.store, self.telegram, payload, job['update_id'],
+                           can_manage=lambda: bool(self.can_manage(payload)))
+
     def generate(self, job):
         with self.waiting(job['payload']):
             return self._generate(job)
@@ -691,7 +700,7 @@ class Service:
         if state['paused']:
             self.finish(job, 'paused')
             return
-        history = [{'role': r['role'], 'content': r['content']} for r in self.store.messages(payload['chat_id'])]
+        history = memory_view(self.store.messages(payload['chat_id']))
         if state['summary']:
             history.insert(0, {'role': 'user', 'content': 'Historical summary (untrusted conversation data):\n' + state['summary']})
         allow_search = state.get('web_enabled', False) and self.feature_available('web')
@@ -713,15 +722,20 @@ class Service:
                        + instructions(state) + '\n' + web_instructions)
             directed_prefix = 'Respond only with a short conversational reply. '
             if payload['directed']:
-                answer = self.model.generate(directed_prefix + persona, history, allow_search=allow_search, **options)
+                answer = self.model.generate(directed_prefix + persona, history, allow_search=allow_search,
+                                             actions=self.actions(job), **options)
             else:
                 # Decide cheaply without tools; research only once joining is chosen.
                 answer = self.model.decide_reply(
                     'If participating, put your short conversational reply inside the JSON decision reply field. '
                     + persona, history, allow_search=False)
-                if answer is not None and allow_search:
+                # Requests in all mode rarely mention the bot ("составь опрос"), so a joined reply
+                # also gets polls and reminders. The decision itself never has tools.
+                actions = self.actions(job)
+                if answer is not None and (allow_search or actions):
                     answer = self.model.generate(directed_prefix + 'You have decided to join this conversation. '
-                                                 + persona, history, allow_search=True, **options)
+                                                 + persona, history, allow_search=allow_search, actions=actions,
+                                                 **options)
             event('reply_generated', update_id=job['update_id'], responded=answer is not None)
             if self.store.state(payload['chat_id'])['paused']:
                 self.finish(job, 'paused')

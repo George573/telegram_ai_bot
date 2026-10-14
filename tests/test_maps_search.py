@@ -70,7 +70,10 @@ class NormalizerTests(unittest.TestCase):
 
     def test_records_are_compact_and_private(self):
         first = maps.normalized_search('u', NIKOLSKAYA, exclude_chains=True)['results'][0]
-        self.assertEqual(first['url'], 'https://yandex.ru/maps/org/176224105875/reviews/')
+        self.assertEqual(first['url'], 'https://yandex.ru/maps/org/176224105875/')
+        self.assertEqual(first['reviews_url'], 'https://yandex.ru/maps/org/176224105875/reviews/')
+        # The reviews reader accepts the place page too, so either link works for it.
+        self.assertEqual(maps.card_url(first['url']), first['reviews_url'])
         self.assertEqual(first['rating'], 4.4)
         self.assertEqual(first['features'][0], 'обжарка кофе')
         self.assertNotIn('Чай', first['features'])

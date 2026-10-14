@@ -311,7 +311,7 @@ class SearchTests(unittest.TestCase):
             self.assertEqual({tool['type'] for tool in body['tools']}, {'function'})
             names = [tool['function']['name'] for tool in body['tools']]
             self.assertEqual(names, ['load_skill', 'search_web', 'read_yandex_maps_search', 'read_yandex_reviews',
-                                     'read_afisha_listing', 'read_afisha_event'])
+                                     'read_afisha_listing', 'read_afisha_event', 'route_link'])
             return self.response()
         self.assertEqual(self.model(handler).generate('Cat', [], allow_search=True), 'Hello')
 

@@ -1,6 +1,6 @@
 """Structured place/event recommendations: schema, validation, grounded plain-text rendering."""
 import re
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 KINDS = ('cafe', 'restaurant', 'bar', 'park', 'theatre', 'concert', 'standup', 'exhibition', 'museum',
          'kids', 'excursion', 'festival', 'other')
@@ -11,6 +11,8 @@ MAX_ITEMS = 5
 LIMITS = {'intro': 300, 'name': 120, 'venue': 150, 'address': 200, 'when': 200, 'price': 100,
           'why': 300, 'reviews': 300, 'caveats': 250, 'relaxed': 150, 'follow_up': 200, 'evidence_gaps': 250}
 NAME = 'place_recommendations'
+# Route links carry two addresses; longer than any page link, still far below Telegram's message limit.
+MAX_URL_CHARS = 2000
 
 
 def nullable(limit):
@@ -105,13 +107,14 @@ def check_text(value, key, nullable):
 
 
 def canonical(url):
-    """Comparable form: https/http, lowercase host, no fragment, no trailing slash."""
+    """Comparable form: https/http, lowercase host, no fragment, no trailing slash, %-escapes decoded."""
     try:
         parts = urlsplit(url.strip())
         if parts.scheme not in {'http', 'https'} or not parts.hostname or parts.username or parts.password:
             return None
         host = parts.hostname.lower().removeprefix('www.')
-        return urlunsplit(('https', host, parts.path.rstrip('/') or '/', parts.query, ''))
+        # "%D0%90" and "А" are the same link; models sometimes copy one as the other.
+        return urlunsplit(('https', host, unquote(parts.path).rstrip('/') or '/', unquote(parts.query), ''))
     except (ValueError, AttributeError):
         return None
 
@@ -125,11 +128,44 @@ def evidence_urls(value):
     elif isinstance(value, (list, tuple)):
         for item in value:
             found |= evidence_urls(item)
-    elif isinstance(value, str) and value.startswith(('http://', 'https://')) and len(value) <= 400:
+    elif isinstance(value, str) and value.startswith(('http://', 'https://')) and len(value) <= MAX_URL_CHARS:
         url = canonical(value)
         if url:
             found.add(url)
     return found
+
+
+MARKDOWN_LINK = re.compile(r'\[([^\]\n]{1,200})\]\((https?://[^\s)]{1,%d})\)' % MAX_URL_CHARS)
+BARE_URL = re.compile(r'https?://[^\s<>()\[\]"\']{1,%d}' % MAX_URL_CHARS)
+LINK_OR_URL = re.compile(MARKDOWN_LINK.pattern + '|(' + BARE_URL.pattern + ')')
+
+
+def text_urls(text):
+    """Canonical URLs written anywhere in free text (conversation messages)."""
+    return {url for url in (canonical(match.rstrip('.,;:!?')) for match in BARE_URL.findall(text or '')) if url}
+
+
+def ground_links(text, allowed):
+    """Keep links the model placed itself only when their URL is known; returns (text, kept, dropped).
+
+    A Markdown link with an unknown URL keeps its label; an unknown bare URL is removed.
+    """
+    counts = {'kept': 0, 'dropped': 0}
+    def check(match):
+        if match.group(1) is not None:  # [label](url)
+            url, keep, lose = match.group(2), match.group(0), match.group(1)
+        else:
+            url = match.group(3).rstrip('.,;:!?')
+            keep, lose = match.group(3), match.group(3)[len(url):]
+        known = canonical(url) in allowed
+        counts['kept' if known else 'dropped'] += 1
+        return keep if known else lose
+    grounded = LINK_OR_URL.sub(check, text)
+    if counts['dropped']:
+        grounded = re.sub(r'[ \t]+([.,;:!?])', r'\1', re.sub(r'[ \t]{2,}', ' ', grounded))
+        # A comma left before a removed trailing URL: "нет, <url>!" becomes "нет!".
+        grounded = re.sub(r'[,;:]([.!?])', r'\1', grounded)
+    return grounded, counts['kept'], counts['dropped']
 
 
 def clean(text):

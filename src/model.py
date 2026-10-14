@@ -21,9 +21,11 @@ from yandex_reviews import card_url
 import yandex_afisha
 import yandex_maps
 import recommendations
-from recommendations import evidence_urls
+from recommendations import canonical, evidence_urls, ground_links, text_urls
 from providers import SEARCH_SITES, SEARCH_RECENCY
 from tool_client import read_afisha_event, read_afisha_listing, read_maps_search, read_reviews
+from action_tools import ACTION_ARGUMENT_CHARS, NAMES as ACTION_NAMES
+import routes
 
 # Backward-compatible alias for callers using the OpenAI price catalog.
 PRICES = PROVIDER_PRICES['openai']
@@ -55,8 +57,12 @@ READER_HINTS = {
         'onward and days from 1 to 7.'}
 READ_EVENTS = {'read_yandex_maps_search': 'maps_search_read', 'read_yandex_reviews': 'reviews_read',
                'read_afisha_listing': 'afisha_read', 'read_afisha_event': 'afisha_read'}
-TOOL_NAMES = frozenset({'load_skill', 'search_web'} | set(READER_LIMITS))
-CARD_READERS = frozenset({'read_yandex_maps_search', 'read_afisha_listing', 'read_afisha_event'})
+TOOL_NAMES = frozenset({'load_skill', 'search_web', 'route_link'} | set(READER_LIMITS))
+
+
+def argument_limit(name):
+    # Poll options and scheduled texts are longer than search or reader arguments.
+    return ACTION_ARGUMENT_CHARS if name in ACTION_NAMES else 1024
 
 
 def search_arguments(arguments):
@@ -257,9 +263,16 @@ class Model:
                 time.sleep(delay)
 
     def generate(self, instructions, history, output_tokens=None, max_chars=3500, response_format=None, allow_search=False,
-                 image=None, require_search=False, on_research=None):
+                 image=None, require_search=False, on_research=None, actions=None):
+        """actions: a chat_actions.ChatActions for this request, enabling polls and scheduled messages."""
         output_tokens = output_tokens or self.config.max_output_tokens
         allow_search = allow_search and 'web' in self.provider.capabilities
+        if response_format is not None or image is not None:
+            actions = None  # Structured decisions and photo descriptions never act.
+        # Names the model may call in this request; anything else is a protocol error.
+        allowed_tools = (TOOL_NAMES if allow_search else frozenset()) | (ACTION_NAMES if actions else frozenset())
+        if actions:
+            instructions += actions.instructions()
         if image is not None and 'images' not in self.provider.capabilities:
             raise ModelFailure('Images are unavailable for this provider')
         if allow_search:
@@ -282,7 +295,18 @@ class Model:
                 'for Moscow theatre, concerts, exhibitions and other events use read_afisha_listing and '
                 'read_afisha_event. Requirements the user states are hard filters, not ranking hints. '
                 'Do not tell the user something cannot be checked without trying the tool. An unavailable result '
-                'is not evidence; disclose the limitation honestly.')
+                'is not evidence; disclose the limitation honestly. '
+                'For how to get somewhere, how far or how long it takes, call route_link and give its link; '
+                'never estimate travel minutes or distance yourself.')
+            instructions += ('\nLinks: you decide whether a link helps. When you name a specific place, event, '
+                'article or page that a tool returned, you may link it inline at that spot, using the exact URL '
+                'from the tool result, as Markdown [name](url) with the place or page name as the link text, '
+                'never a bare word like «ссылка». For example, link the Yandex Maps place page (url, not '
+                'reviews_url) of a place someone should walk to, or the event page where tickets are sold. '
+                'Link what the reader will likely open, especially the option you recommend most, not every '
+                'mention, and do not add your own list of sources. Copy URLs exactly; '
+                'never invent, shorten or edit them. Links that appear neither in tool results nor in this '
+                'conversation are removed before sending.')
             instructions += ('\nWhen verifying a previously named place, search its exact name plus address '
                 'and city, including spelling variants when needed, before withdrawing it as unconfirmed. '
                 'Prefer official websites, exact organization cards and event pages over category lists. '
@@ -350,11 +374,11 @@ class Model:
                     history, output_tokens, result_format,
                     allow_search, image, require_search and allow_search and not search_confirmed,
                     skill_enabled=allow_search and len(loaded_skills) < len(SKILL_NAMES), continuation=continuation,
-                    readers_enabled=allow_search)
+                    readers_enabled=allow_search, actions_enabled=bool(actions))
                 if len(response.tool_calls) > 1:
                     # Validate the whole batch before any local read or search.
                     # Replay its assistant message once, then all matching tool results.
-                    error = self._tool_batch_error(response.tool_calls, allow_search)
+                    error = self._tool_batch_error(response.tool_calls, allowed_tools)
                     if error:
                         event('skill_failed', level=logging.WARNING, provider=self.config.provider,
                               model=self.config.model, reason='invalid_skill_call',
@@ -382,23 +406,23 @@ class Model:
                     continue
                 return self._finish(response.text, instructions, history, output_tokens, image, continuation,
                                     sources, evidence, max_chars, response_format, result_format,
-                                excluded_names=excluded_names)
+                                excluded_names=excluded_names, check_links=allow_search)
             # Process validated calls; extra calls in a batch get a short rejection.
             # No model-controlled paths, shell commands, or arbitrary tools.
-            if not allow_search:
+            if not allowed_tools:
                 event('skill_failed', level=logging.WARNING, provider=self.config.provider,
                       model=self.config.model, reason='invalid_skill_call', tool_call_count=len(response.tool_calls),
                       tool_error='tools_disabled')
                 raise ModelFailure('Invalid skill call')
             call = response.tool_calls[0]
             tool_name = call.name if isinstance(call.name, str) else 'other'
-            if (tool_name not in TOOL_NAMES or not isinstance(call.call_id, str) or not call.call_id
-                    or not isinstance(call.arguments, str) or len(call.arguments) > 1024):
+            if (tool_name not in allowed_tools or not isinstance(call.call_id, str) or not call.call_id
+                    or not isinstance(call.arguments, str) or len(call.arguments) > argument_limit(tool_name)):
                 event('skill_failed', level=logging.WARNING, provider=self.config.provider,
                       model=self.config.model, reason='invalid_skill_call',
-                      requested_tool=tool_name if tool_name in TOOL_NAMES | {'web_search'} else 'other',
+                      requested_tool=tool_name if tool_name in TOOL_NAMES | ACTION_NAMES | {'web_search'} else 'other',
                       tool_call_count=1, argument_chars=len(call.arguments) if isinstance(call.arguments, str) else None,
-                      tool_error='unknown_tool' if tool_name not in TOOL_NAMES else
+                      tool_error='unknown_tool' if tool_name not in allowed_tools else
                                  'missing_call_id' if not isinstance(call.call_id, str) or not call.call_id else
                                  'argument_type' if not isinstance(call.arguments, str) else 'arguments_too_long')
                 raise ModelFailure('Invalid skill call')
@@ -409,6 +433,10 @@ class Model:
                 tool_output(call, rejected('too_many_calls', f'At most {MAX_TOOL_CALLS_PER_BATCH} tool calls '
                                            'run per step. Request fewer, more targeted calls.'))
                 continue
+            if call.name in ACTION_NAMES:
+                # Mistakes come back as fixable tool results, never as a failed reply.
+                tool_output(call, actions.call(call.name, call.arguments))
+                continue
             tool_error = 'malformed_arguments'
             try:
                 def unique_arguments(pairs):
@@ -418,13 +446,13 @@ class Model:
                     return value
                 arguments = json.loads(call.arguments, object_pairs_hook=unique_arguments)
                 tool_error = 'invalid_arguments'
+                if call.name == 'route_link':
+                    tool_output(call, self._route_call(arguments, evidence))
+                    continue
                 if call.name in READER_LIMITS:
                     researching(call.name)
+                    # Readers alone never switch to cards: only a loaded skill defines that shape.
                     tool_output(call, self._reader_call(call, arguments, reader_results, reader_counts, remember, sources))
-                    if (call.name in CARD_READERS and response_format is None and result_format is None):
-                        # Place/event research produces cards even if the model skipped load_skill.
-                        result_format = recommendations.FORMAT
-                        instructions += recommendations.INSTRUCTIONS
                     continue
                 if call.name == 'search_web':
                     query, site, recency = search_arguments(arguments)
@@ -512,17 +540,26 @@ class Model:
               output_chars=len(response.text), duration_ms=int((time.monotonic() - started) * 1000))
         return self._finish(response.text, final_instructions, history, output_tokens, image, continuation,
                             sources, evidence, max_chars, response_format, result_format,
-                                excluded_names=excluded_names)
+                                excluded_names=excluded_names, check_links=allow_search)
 
     def _finish(self, text, instructions, history, output_tokens, image, continuation, sources, evidence,
-                max_chars, response_format, result_format, excluded_names=()):
+                max_chars, response_format, result_format, excluded_names=(), check_links=False):
         text = text.strip()
         if result_format is recommendations.FORMAT and response_format is None:
             return self._render_recommendations(text, instructions, history, output_tokens, image,
                                                 continuation, sources, evidence, max_chars, excluded_names)
         if response_format:
             return ModelText(text[:max_chars] if max_chars else text, sources[:3])
-        sources = cited_sources(text, sources)
+        if check_links:
+            # The model places links itself; only URLs from tool results or the conversation survive.
+            known = set(evidence).union(*(text_urls(row['content']) for row in history
+                                          if isinstance(row.get('content'), str)))
+            text, kept, dropped = ground_links(text, known)
+            event('reply_links_checked', provider=self.config.provider, model=self.config.model,
+                  kept_links=kept, dropped_links=dropped)
+        # Sources already linked inline are not listed again.
+        inline = text_urls(text)
+        sources = [source for source in cited_sources(text, sources) if canonical(source[1]) not in inline]
         return with_sources(text, sources[:3], max_chars) if max_chars else ModelText(text, sources[:3])
 
     def _render_recommendations(self, raw, instructions, history, output_tokens, image, continuation,
@@ -563,8 +600,8 @@ class Model:
               dropped_links=dropped, dropped_items=removed)
         return ModelText(text, sources[:3], cards=bool(value['items']))
 
-    def _tool_batch_error(self, calls, allow_search):
-        if not allow_search:
+    def _tool_batch_error(self, calls, allowed_tools):
+        if not allowed_tools:
             return 'tools_disabled'
         ids = set()
         def unique(pairs):
@@ -573,7 +610,7 @@ class Model:
                 raise ValueError('Duplicate argument')
             return result
         for call in calls:
-            if not isinstance(call.name, str) or call.name not in TOOL_NAMES:
+            if not isinstance(call.name, str) or call.name not in allowed_tools:
                 return 'unknown_tool'
             if not isinstance(call.call_id, str) or not call.call_id:
                 return 'missing_call_id'
@@ -582,8 +619,10 @@ class Model:
             ids.add(call.call_id)
             if not isinstance(call.arguments, str):
                 return 'argument_type'
-            if len(call.arguments) > 1024:
+            if len(call.arguments) > argument_limit(call.name):
                 return 'arguments_too_long'
+            if call.name in ACTION_NAMES:
+                continue  # Action arguments are checked per call and explained to the model.
             try:
                 arguments = json.loads(call.arguments, object_pairs_hook=unique)
             except (ValueError, TypeError):
@@ -598,10 +637,26 @@ class Model:
                     search_arguments(arguments)
                 except ValueError:
                     return 'invalid_arguments'
+            elif call.name == 'route_link':
+                continue  # Route arguments are checked per call and explained to the model.
             elif set(arguments) != READER_KEYS[call.name]:
                 # Reader values are checked per call and returned to the model when wrong.
                 return 'invalid_arguments'
         return None
+
+    def _route_call(self, arguments, evidence):
+        """A local Yandex Maps route link; mistakes go back to the model to fix."""
+        try:
+            result = routes.route_link(arguments)
+        except routes.RouteError as error:
+            event('route_link_failed', level=logging.WARNING, provider=self.config.provider, model=self.config.model,
+                  requested_tool='route_link', tool_error='invalid_arguments')
+            return json.dumps({'status': 'error', 'field': error.field, 'message': str(error),
+                               'next_step': 'No link was built. Correct the field and call route_link again.'},
+                              ensure_ascii=False)
+        evidence.update(evidence_urls(result['url']))  # The link check keeps the built route.
+        event('route_link_created', provider=self.config.provider, model=self.config.model, requested_tool='route_link')
+        return json.dumps(result, ensure_ascii=False)
 
     def _reader_call(self, call, arguments, results, counts, remember, sources):
         """Run one bounded browser reader; invalid targets go back to the model as tool errors."""
@@ -700,7 +755,8 @@ class Model:
             raise ModelFailure('Web search failed') from None
 
     def _generation_attempt(self, instructions, history, output_tokens, response_format,
-                            allow_search, image, require_search, *, skill_enabled, continuation, readers_enabled=False):
+                            allow_search, image, require_search, *, skill_enabled, continuation, readers_enabled=False,
+                            actions_enabled=False):
         request_model = self.provider.generation_model(self.config.model, image)
         if image is not None and len(image) > min(self.config.media_max_bytes, IMAGE_MAX_BYTES[self.config.provider]):
             raise ModelFailure('Photo exceeds size limit')
@@ -721,14 +777,15 @@ class Model:
         started = time.monotonic()
         response = None
         event('ai_request_started', provider=self.config.provider, model=request_model,
-              operation=operation, reserved_usd=reserved, web_search_enabled=allow_search)
+              operation=operation, reserved_usd=reserved, web_search_enabled=allow_search,
+              actions_enabled=actions_enabled)
         # If a request fails or the process crashes, keep the conservative reservation.
         try:
             response = self.request(lambda: self.provider.generate(model=request_model,
                 instructions=instructions, history=history, output_tokens=output_tokens,
                 response_format=response_format, allow_search=allow_search, image=image,
                 require_search=require_search, skill_enabled=skill_enabled, continuation=continuation,
-                readers_enabled=readers_enabled),
+                readers_enabled=readers_enabled, **({'actions_enabled': True} if actions_enabled else {})),
                 reserved, request_model, operation)
             charged = reserved
             if response.input_tokens is not None and response.output_tokens is not None:

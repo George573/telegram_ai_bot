@@ -35,12 +35,14 @@ EVENTS = frozenset({
     'maps_search_read_started', 'maps_search_read_completed', 'maps_search_read_failed',
     'callback_received', 'callback_failed', 'prompt_created', 'prompt_answered', 'progress_shown',
     'crash_notice_sent', 'status_message_edited', 'status_message_failed', 'commands_registered',
+    'action_completed', 'action_failed', 'scheduled_delivered', 'scheduled_failed', 'reply_links_checked',
+    'route_link_created', 'route_link_failed',
 })
 NUMBERS = frozenset({'duration_ms', 'input_tokens', 'output_tokens', 'search_calls',
                      'update_id', 'status_code', 'retry_after', 'attempt', 'delay_ms', 'error_position',
                      'error_line', 'error_column', 'output_chars', 'repair_attempt', 'max_repairs', 'query_chars', 'result_count',
                      'tool_call_count', 'argument_chars', 'returned_chars', 'model_rounds', 'review_count',
-                     'failure_count', 'dropped_links', 'dropped_items', 'reasoning_tokens', 'model_requests', 'failed_requests',
+                     'failure_count', 'dropped_links', 'kept_links', 'dropped_items', 'reasoning_tokens', 'model_requests', 'failed_requests',
                      'searches', 'reader_calls', 'reader_ok', 'skills_loaded', 'json_repairs'})
 AMOUNTS = frozenset({'reserved_usd', 'charged_usd', 'budget_usd', 'spent_usd'})
 OUTCOMES = frozenset({'accepted', 'refused', 'delivered', 'silent', 'fallback_delivered', 'paused', 'not_directed', 'rate_limited',
@@ -62,12 +64,17 @@ ENUMS = {'parser_error': frozenset({'expected_value', 'extra_data', 'expected_ke
          'format_mode': frozenset({'json_schema', 'json_object'}),
          'json_repair_mode': frozenset({'format_only'}),
          'requested_tool': frozenset({'load_skill', 'search_web', 'web_search', 'read_yandex_reviews',
-                                     'read_afisha_listing', 'read_afisha_event', 'read_yandex_maps_search', 'other'}),
+                                     'read_afisha_listing', 'read_afisha_event', 'read_yandex_maps_search',
+                                     'route_link', 'send_poll', 'schedule_message', 'list_scheduled_messages',
+                                     'cancel_scheduled_message', 'other'}),
+         'scheduled_kind': frozenset({'text', 'poll'}),
          'tool_error': frozenset({'tools_disabled', 'step_limit', 'multiple_calls', 'unknown_tool',
                                 'missing_call_id', 'argument_type', 'arguments_too_long',
                                 'malformed_arguments', 'invalid_arguments', 'repeated_skill_limit',
                                 'batch_limit', 'duplicate_call_id', 'search_limit',
-                                'too_many_calls', 'review_limit', 'context_budget', 'invalid_url'}),
+                                'too_many_calls', 'review_limit', 'context_budget', 'invalid_url',
+                                'action_limit', 'pending_limit', 'telegram_rejected', 'rate_limited',
+                                'delivery_uncertain', 'not_allowed'}),
          'finish_reason': frozenset({'stop', 'tool_calls', 'length', 'sensitive', 'model_context_window_exceeded',
                                     'network_error', 'completed', 'incomplete', 'failed', 'content_filter'}),
          'incomplete_reason': frozenset({'max_output_tokens', 'content_filter'}),
@@ -258,7 +265,7 @@ def event(name, *, level=logging.INFO, **fields):
             data[key] = str(value)
         elif key in {'json_request_id', 'search_request_id', 'reviews_request_id'} and isinstance(value, str) and re.fullmatch(r'[0-9a-f]{32}', value):
             data[key] = value
-        elif key in {'responded', 'web_search_enabled', 'previous_answer_included', 'error_feedback_included',
+        elif key in {'responded', 'web_search_enabled', 'actions_enabled', 'previous_answer_included', 'error_feedback_included',
                      'explicit_search_available', 'filters_applied', 'round_limit', 'budget_exceeded',
                      'directed', 'notified'} and type(value) is bool:
             data[key] = value

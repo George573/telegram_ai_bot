@@ -39,6 +39,45 @@ def compact_plan(rows, limit, slots=0):
     return rows[:max(1, len(rows) - max(1, limit // 2 - slots))]
 
 
+# Older long bot replies reach the model shortened; the newest ones stay whole for follow-up questions.
+KEEP_FULL_REPLIES = 2
+SHORTEN_OVER = 800
+SHORTENED_NOTE = ('[Earlier bot reply, shortened in memory: explanations, review notes and caveats were left out. '
+                  'If someone asks about left-out details, check again with tools or say you no longer have them; '
+                  'do not reconstruct them from memory.]\n')
+# Card lines that are prose about an item rather than its facts (why, reviews, caveats, near-miss, gaps).
+PROSE_LINES = ('💡 ', '⭐ ', '⚠️ ', '↔ ', '❔ ')
+CARD_HEAD = re.compile(r'\d+\. \S+ \*\*')
+
+
+def shorten_reply(text):
+    """Facts a follow-up may need (names, times, prices, addresses, links), without the prose around them."""
+    lines = text.split('\n')
+    if any(CARD_HEAD.match(line) for line in lines):
+        kept = [line for line in lines if not line.startswith(PROSE_LINES)]
+    else:
+        # Plain text: the opening up to a line boundary, plus every later line with a link.
+        opening, size = [], 0
+        for line in lines:
+            if size + len(line) > SHORTEN_OVER // 2:
+                break
+            opening.append(line)
+            size += len(line) + 1
+        links = [line for line in lines[len(opening):] if 'http' in line]
+        kept = opening + ['…'] + links
+    short = re.sub(r'\n{3,}', '\n\n', '\n'.join(kept)).strip()
+    return SHORTENED_NOTE + short if len(short) + len(SHORTENED_NOTE) < len(text) - 300 else text
+
+
+def memory_view(rows):
+    """History for the model: every row, with older long assistant replies shortened."""
+    replies = [index for index, row in enumerate(rows) if row['role'] == 'assistant']
+    recent = set(replies[-KEEP_FULL_REPLIES:])
+    return [{'role': row['role'], 'content': shorten_reply(row['content'])
+             if row['role'] == 'assistant' and index not in recent and len(row['content']) > SHORTEN_OVER
+             else row['content']} for index, row in enumerate(rows)]
+
+
 def normalize(update, allowed, bot):
     message = update.get('message', {})
     chat = message.get('chat', {})

@@ -5,6 +5,7 @@ from pathlib import Path
 from observability import configure_logging, event
 import logging
 from concurrent.futures import ThreadPoolExecutor
+from chat_actions import deliver_due
 from config import Config
 from model import Model, RequestPacer
 from policy import normalize, normalize_callback
@@ -131,6 +132,11 @@ def main():
                     store.maintenance(scheduler.active)
                     next_maintenance = time.monotonic() + 60
                 scheduler.tick(store.runnable_chats())
+                try:
+                    deliver_due(store, telegram, config.chats)
+                except Exception:
+                    # A scheduled send must never stop polling; the row stays marked and is not resent.
+                    event('scheduled_failed', level=logging.ERROR, reason='unexpected_error')
                 try:
                     updates = telegram.call('getUpdates', offset=store.checkpoint(), limit=100,
                         timeout=1, allowed_updates=['message', 'callback_query'])

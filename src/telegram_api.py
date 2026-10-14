@@ -9,8 +9,11 @@ import httpx
 
 
 class TelegramFailure(Exception):
-    def __init__(self, code=0, retry_after=0, not_sent=False, not_modified=False):
+    def __init__(self, code=0, retry_after=0, not_sent=False, not_modified=False, description=''):
         super().__init__('Telegram request failed')
+        # Telegram's own error text (e.g. "Bad Request: poll must have at least 2 option"). It never
+        # contains the token, but it is still never logged; only action tools show it to the model.
+        self.description = description
         self.code = code
         self.retry_after = retry_after
         # True only when the request certainly never reached Telegram (connect failure).
@@ -38,7 +41,8 @@ class TelegramAPI:
             if not body.get('ok'):
                 description = str(body.get('description') or '')
                 raise TelegramFailure(body.get('error_code', 0), body.get('parameters', {}).get('retry_after', 0),
-                                      not_modified='message is not modified' in description)
+                                      not_modified='message is not modified' in description,
+                                      description=description[:300])
             return body['result']
         except TelegramFailure:
             raise
@@ -143,6 +147,33 @@ class TelegramAPI:
         if reply_markup:
             params['reply_markup'] = reply_markup
         return self.formatted('sendMessage', params, text)
+
+    @staticmethod
+    def placement(chat_id, thread_id=None, reply_to=None):
+        params = {'chat_id': chat_id}
+        if thread_id:
+            params['message_thread_id'] = thread_id
+        if reply_to:
+            params['reply_parameters'] = {'message_id': reply_to, 'allow_sending_without_reply': True}
+        return params
+
+    def send_text(self, chat_id, text, thread_id=None, reply_to=None):
+        """A scheduled message: formatted like replies, threaded to the request when it still exists."""
+        params = {**self.placement(chat_id, thread_id, reply_to), 'link_preview_options': {'is_disabled': True}}
+        return self.formatted('sendMessage', params, text)
+
+    def send_poll(self, chat_id, poll, thread_id=None, reply_to=None):
+        """A native poll or quiz from chat_actions.poll_content()."""
+        params = {**self.placement(chat_id, thread_id, reply_to), 'question': poll['question'],
+                  'options': [{'text': option} for option in poll['options']], 'type': poll['type'],
+                  'is_anonymous': poll['is_anonymous']}
+        if poll['type'] == 'quiz':
+            params['correct_option_id'] = poll['correct_option_id']
+            if poll.get('explanation'):
+                params['explanation'] = poll['explanation']
+        else:
+            params['allows_multiple_answers'] = poll['allows_multiple_answers']
+        return self.call('sendPoll', **params)
 
     def edit(self, chat_id, message_id, text, markup=None):
         """Edit a bot message in place; identical content counts as success."""

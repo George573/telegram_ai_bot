@@ -9,10 +9,12 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from urllib.parse import urlsplit
 from openai import OpenAI, BadRequestError
+from action_tools import TOOLS as ACTION_TOOLS
 from skill_registry import LOAD_SKILL
 from yandex_afisha import READ_AFISHA_EVENT, READ_AFISHA_LISTING
 from yandex_maps import READ_YANDEX_MAPS_SEARCH
 from yandex_reviews import READ_YANDEX_REVIEWS
+from routes import ROUTE_LINK
 
 PRICES = {
     'openai': {'gpt-6-luna': (Decimal('0.10'), Decimal('0.50')),
@@ -49,7 +51,7 @@ SEARCH_WEB = {'name': 'search_web',
         'site': {'type': ['string', 'null'], 'enum': [*SEARCH_SITES, None]},
         'recency': {'type': ['string', 'null'], 'enum': [*SEARCH_RECENCY, None]}},
         'required': ['query', 'site', 'recency'], 'additionalProperties': False}}
-READERS = (READ_YANDEX_MAPS_SEARCH, READ_YANDEX_REVIEWS, READ_AFISHA_LISTING, READ_AFISHA_EVENT)
+READERS = (READ_YANDEX_MAPS_SEARCH, READ_YANDEX_REVIEWS, READ_AFISHA_LISTING, READ_AFISHA_EVENT, ROUTE_LINK)
 # Search requests leave the bot with a fixed location hint, never user data.
 SEARCH_LOCATION = {'type': 'approximate', 'country': 'RU', 'city': 'Moscow', 'timezone': 'Europe/Moscow'}
 # Models whose reasoning shares max_tokens with the visible answer, and the extra room they get.
@@ -68,12 +70,12 @@ def strict_schema(schema):
     return schema
 
 
-def function_tools(allow_search, skill_enabled, readers_enabled):
+def function_tools(allow_search, skill_enabled, readers_enabled, actions_enabled=False):
     """The same local tools for every provider, in a fixed order."""
     tools = [SEARCH_WEB] if allow_search else []
     if skill_enabled:
         tools.insert(0, LOAD_SKILL)  # Keep skill discovery first.
-    return tools + (list(READERS) if readers_enabled else [])
+    return tools + (list(READERS) if readers_enabled else []) + (list(ACTION_TOOLS) if actions_enabled else [])
 
 
 def search_query(query, site):
@@ -250,13 +252,13 @@ class OpenAIProvider:
 
     def generate(self, *, model, instructions, history, output_tokens,
                  response_format=None, allow_search=False, image=None, require_search=False,
-                 skill_enabled=False, continuation=(), readers_enabled=False):
+                 skill_enabled=False, continuation=(), readers_enabled=False, actions_enabled=False):
         extra = {'text': {'format': {**response_format, 'schema': strict_schema(response_format['schema'])}}} if response_format else {}
         if image is not None:
             encoded = base64.b64encode(image).decode('ascii')
             history = history + [{'role': 'user', 'content': [
                 {'type': 'input_image', 'image_url': 'data:image/jpeg;base64,' + encoded, 'detail': 'low'}]}]
-        tools = function_tools(allow_search, skill_enabled, readers_enabled)
+        tools = function_tools(allow_search, skill_enabled, readers_enabled, actions_enabled)
         if tools:
             extra['tools'] = [{'type': 'function', 'name': tool['name'], 'description': tool['description'],
                                'parameters': strict_schema(tool['parameters']), 'strict': True} for tool in tools]
@@ -345,7 +347,7 @@ class ZaiProvider:
 
     def generate(self, *, model, instructions, history, output_tokens,
                  response_format=None, allow_search=False, image=None, require_search=False,
-                 skill_enabled=False, continuation=(), readers_enabled=False):
+                 skill_enabled=False, continuation=(), readers_enabled=False, actions_enabled=False):
         if image is not None:
             if model not in VISION_PRICES or len(image) > IMAGE_MAX_BYTES['zai']:
                 raise ProviderFailure('Unsupported or oversized image')
@@ -354,10 +356,10 @@ class ZaiProvider:
                 {'type': 'image_url', 'image_url': {'url': 'data:image/jpeg;base64,' + encoded}},
                 {'type': 'text', 'text': 'Describe this photo.'}]}]
         extra = {}
-        tools = function_tools(allow_search, skill_enabled, readers_enabled)
+        tools = function_tools(allow_search, skill_enabled, readers_enabled, actions_enabled)
         if tools:
             extra['tools'] = [{'type': 'function', 'function': tool} for tool in tools]
-        if allow_search or skill_enabled:
+        if allow_search or skill_enabled or actions_enabled:
             instructions += ('\nYou may call multiple functions in one response; each call receives a result. For explicit public lookup call search_web '
                 '(not a function named web_search). After load_skill returns its instructions, do not load it again.')
         if response_format:

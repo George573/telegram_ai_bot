@@ -17,7 +17,7 @@ class PostgresTests(unittest.TestCase):
     def setUp(self):
         self.conn=psycopg.connect('host=db dbname=roleplay user=roleplay password=test-only-password',autocommit=True,row_factory=dict_row)
         self.store=Store(50,self.conn)
-        self.conn.execute('TRUNCATE messages, chats, jobs, rate_limits, prompts CASCADE')
+        self.conn.execute('TRUNCATE messages, chats, jobs, rate_limits, prompts, scheduled_messages CASCADE')
         self.conn.execute('UPDATE runtime SET next_update=0,spent=0')
     def tearDown(self): self.conn.close()
     def test_atomic_checkpoint_and_deduplication(self):
@@ -363,6 +363,34 @@ class PostgresTests(unittest.TestCase):
         self.assertFalse(self.store.state(-1)['images_enabled'])
         self.assertIsNone(self.store.next_job()['payload']['media'])
         self.assertNotIn('file_id', str(self.store.next_job()['payload']))
+
+    def test_scheduled_messages_dedupe_limit_cancel_and_delivery_states(self):
+        from datetime import datetime, timedelta, timezone
+        soon = datetime.now(timezone.utc) + timedelta(hours=1)
+        options = dict(created_by=10, reply_to=2, source_update=5)
+        row, created = self.store.schedule(-1, 7, 'text', {'text': 'Пора'}, soon, fingerprint='a', **options)
+        self.assertTrue(created)
+        again, created = self.store.schedule(-1, 7, 'text', {'text': 'Пора'}, soon, fingerprint='a', **options)
+        self.assertEqual((again['id'], created), (row['id'], False))
+        self.assertIsNone(self.store.schedule(-1, 0, 'text', {'text': 'x'}, soon, fingerprint='b',
+                                              max_pending=1, **options)[0])
+        self.assertEqual([r['content'] for r in self.store.scheduled(-1)], [{'text': 'Пора'}])
+        self.assertEqual(self.store.scheduled_item(-1, row['id'])['thread_id'], 7)
+        self.assertIsNone(self.store.scheduled_item(-2, row['id']))
+        self.assertEqual(self.store.due_scheduled(), [])
+        self.conn.execute("UPDATE scheduled_messages SET send_at=now()-interval '1 second'")
+        self.assertEqual([r['id'] for r in self.store.due_scheduled()], [row['id']])
+        self.store.retry_scheduled(row['id'], 60)
+        self.assertEqual(self.store.due_scheduled(), [])
+        self.assertTrue(self.store.cancel_scheduled(-1, row['id']))
+        self.assertFalse(self.store.cancel_scheduled(-1, row['id']))
+        sending, _ = self.store.schedule(-1, 0, 'poll', {'question': 'Q'}, soon, fingerprint='c', status='sending', **options)
+        self.conn.execute("UPDATE scheduled_messages SET updated_at=now()-interval '11 minutes' WHERE id=%s", (sending['id'],))
+        self.store.maintenance()
+        self.assertEqual(self.conn.execute('SELECT status FROM scheduled_messages WHERE id=%s', (sending['id'],)).fetchone()['status'], 'unknown')
+        self.store.schedule(-1, 0, 'text', {'text': 'mine'}, soon, fingerprint='d', **options)
+        self.store.forget_user(-1, 10, 0)
+        self.assertEqual(self.conn.execute('SELECT count(*) AS n FROM scheduled_messages').fetchone()['n'], 0)
 
     def test_newer_schema_is_rejected_without_changing_state(self):
         from storage import MIGRATIONS

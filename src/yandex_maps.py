@@ -20,11 +20,13 @@ SEARCH_URL = 'https://yandex.ru/maps/213/moscow/search/{}/'
 READ_YANDEX_MAPS_SEARCH = {
     'name': 'read_yandex_maps_search',
     'description': 'Search Yandex Maps in Moscow like a user would ("кофейня Никольская", "галерея современного '
-                   'искусства Хамовники") and get up to 10 organizations: exact card URL, address, nearest metro, '
+                   'искусства Хамовники") and get up to 10 organizations: place page URL, address, nearest metro, '
                    'rating with rating/review counts, hours and open-now status, key features, per-topic review '
                    'sentiment (e.g. drinks, service) and chain status. Set exclude_chains true when the user asks '
                    'for non-chain/independent places: chains are then removed before you see the results. '
-                   'Use the returned card URL with read_yandex_reviews for finalists.',
+                   'Each result has two links: url is the place page for people (map, route, hours), so link that '
+                   'one in answers; reviews_url is for read_yandex_reviews when you check finalists. coordinates '
+                   '("lat,lon") can be passed to route_link for directions.',
     'parameters': {'type': 'object', 'properties': {
         'query': {'type': 'string', 'description': 'Category plus street, district or metro, in Russian'},
         'exclude_chains': {'type': 'boolean'}},
@@ -65,6 +67,14 @@ def _number(value, low, high):
     except (TypeError, ValueError):
         return None
     return number if math.isfinite(number) and low <= number <= high else None
+
+
+def _coordinates(value):
+    """Yandex gives [lon, lat]; route_link takes "lat,lon"."""
+    if not isinstance(value, list) or len(value) != 2:
+        return None
+    lon, lat = _number(value[0], -180, 180), _number(value[1], -90, 90)
+    return f'{lat:.6f},{lon:.6f}' if lat is not None and lon is not None else None
 
 
 def _count(value):
@@ -148,11 +158,14 @@ def normalized_search(url, items, exclude_chains=False):
                  if isinstance(m, dict) and _text(m.get('name'), 40)]
         awards = item.get('awards') if isinstance(item.get('awards'), dict) else {}
         results.append({
-            'name': _text(item.get('title'), 120), 'url': card,
+            # The place page for people; the reviews tab only feeds read_yandex_reviews.
+            'name': _text(item.get('title'), 120), 'url': card.removesuffix('reviews/'), 'reviews_url': card,
             'categories': [c for c in (_text(x.get('name'), 40) for x in (item.get('categories') or [])[:3]
                                        if isinstance(x, dict)) if c],
             'address': _text(item.get('address') or item.get('fullAddress'), 160), 'metro': metro,
-            'rating': round(_number(rating.get('ratingValue'), 0, 5), 1) if _number(rating.get('ratingValue'), 0, 5) is not None else None, 'rating_count': _count(rating.get('ratingCount')),
+            # Yandex sends ratingValue 0 with real counts when no score is shown; real scores are 1–5.
+            'rating': round(_number(rating.get('ratingValue'), 1, 5), 1) if _number(rating.get('ratingValue'), 1, 5) is not None else None, 'rating_count': _count(rating.get('ratingCount')),
+            'coordinates': _coordinates(item.get('coordinates')),
             'review_count': _count(rating.get('reviewCount')),
             'hours': _text(item.get('workingTimeText'), 120), 'open_now': status.get('isOpenNow')
             if type(status.get('isOpenNow')) is bool else None,

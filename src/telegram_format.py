@@ -8,7 +8,7 @@ import html
 import re
 
 _CODE = re.compile(r'`([^`\n]{1,300})`')
-_LINK = re.compile(r'\[([^\]\n]{1,200})\]\((https?://[^\s)]{1,400})\)')
+_LINK = re.compile(r'\[([^\]\n]{1,200})\]\((https?://[^\s)]{1,2000})\)')  # Same limit as recommendations.MAX_URL_CHARS.
 _BOLD = re.compile(r'(\*\*|__)(?=\S)([^\n]+?)(?<=\S)\1')
 _STRIKE = re.compile(r'~~(?=\S)(.+?)(?<=\S)~~')
 _ITALIC_STAR = re.compile(r'(?<![\w*])\*(?=[^\s*])([^*\n]+?)(?<=[^\s*])\*(?![\w*])')

@@ -92,6 +92,17 @@ CREATE TABLE prompts (
 CREATE INDEX prompts_user_idx ON prompts(chat_id,user_id);
 """,
     "ALTER TABLE chats ADD COLUMN menu_button BOOLEAN NOT NULL DEFAULT FALSE;",
+    """
+CREATE TABLE scheduled_messages (
+ id BIGSERIAL PRIMARY KEY, chat_id BIGINT NOT NULL, thread_id BIGINT NOT NULL DEFAULT 0,
+ kind TEXT NOT NULL CHECK(kind IN ('text','poll')), content JSONB NOT NULL, send_at TIMESTAMPTZ NOT NULL,
+ status TEXT NOT NULL DEFAULT 'pending', created_by BIGINT, reply_to BIGINT,
+ source_update BIGINT NOT NULL, fingerprint TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+ message_id BIGINT, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+ UNIQUE(source_update,fingerprint));
+CREATE INDEX scheduled_due_idx ON scheduled_messages(status,send_at);
+CREATE INDEX scheduled_chat_idx ON scheduled_messages(chat_id,status);
+""",
 )
 
 
@@ -250,6 +261,10 @@ class Store:
             self.conn.execute('DELETE FROM personality_drafts WHERE expires_at<=now()')
             self.conn.execute('DELETE FROM prompts WHERE expires_at<=now()')
             self.conn.execute("DELETE FROM rate_limits WHERE updated_at < now()-interval '1 hour'")
+            # A send interrupted by a crash is never repeated; finished rows are kept a week for duplicate checks.
+            self.conn.execute("UPDATE scheduled_messages SET status='unknown',updated_at=now() WHERE status='sending' "
+                              "AND updated_at < now()-interval '10 minutes'")
+            self.conn.execute("DELETE FROM scheduled_messages WHERE status<>'pending' AND updated_at < now()-interval '7 days'")
 
     def forget_user(self, chat_id, user_id, update_id):
         with self.transaction():
@@ -261,6 +276,7 @@ class Store:
             self.conn.execute("UPDATE conversations SET summary='',summary_started_at=NULL WHERE chat_id=%s", (chat_id,))
             self.delete_drafts(chat_id, user_id)
             self.conn.execute('DELETE FROM prompts WHERE chat_id=%s AND user_id=%s', (chat_id, user_id))
+            self.conn.execute('DELETE FROM scheduled_messages WHERE chat_id=%s AND created_by=%s', (chat_id, user_id))
             self.conn.execute("DELETE FROM jobs WHERE payload->>'chat_id'=%s AND update_id<>%s AND (payload->>'user_id'=%s OR phase<>'queued')", (str(chat_id),update_id,str(user_id)))
 
     def clear(self, chat_id):
@@ -382,6 +398,53 @@ class Store:
 
     def mark_reply(self, chat_id):
         self.conn.execute('UPDATE conversations SET last_reply=now() WHERE chat_id=%s AND thread_id=%s', (chat_id,self.thread_id))
+
+    # --- Scheduled messages and polls ------------------------------------------------
+    def schedule(self, chat_id, thread_id, kind, content, send_at, *, created_by, reply_to, source_update,
+                 fingerprint, status='pending', max_pending=25):
+        """(row, created); the existing row for a repeated request, or (None, False) over the pending limit."""
+        with self.transaction():
+            existing = self.conn.execute('SELECT * FROM scheduled_messages WHERE source_update=%s AND fingerprint=%s',
+                                         (source_update, fingerprint)).fetchone()
+            if existing:
+                return existing, False
+            pending = self.conn.execute("SELECT count(*) AS n FROM scheduled_messages WHERE chat_id=%s AND status='pending'",
+                                        (chat_id,)).fetchone()['n']
+            if status == 'pending' and pending >= max_pending:
+                return None, False
+            row = self.conn.execute('''INSERT INTO scheduled_messages(chat_id,thread_id,kind,content,send_at,status,
+                created_by,reply_to,source_update,fingerprint) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *''',
+                (chat_id, thread_id or 0, kind, Jsonb(content), send_at, status, created_by, reply_to,
+                 source_update, fingerprint)).fetchone()
+            return row, True
+
+    def scheduled(self, chat_id, limit=25):
+        return self.conn.execute('''SELECT * FROM scheduled_messages WHERE chat_id=%s AND status='pending'
+            ORDER BY send_at,id LIMIT %s''', (chat_id, limit)).fetchall()
+
+    def scheduled_item(self, chat_id, item_id):
+        return self.conn.execute("SELECT * FROM scheduled_messages WHERE chat_id=%s AND id=%s AND status='pending'",
+                                 (chat_id, item_id)).fetchone()
+
+    def cancel_scheduled(self, chat_id, item_id):
+        return self.conn.execute('''UPDATE scheduled_messages SET status='cancelled',updated_at=now()
+            WHERE chat_id=%s AND id=%s AND status='pending' RETURNING id''', (chat_id, item_id)).fetchone() is not None
+
+    def due_scheduled(self, limit=10):
+        return self.conn.execute('''SELECT * FROM scheduled_messages WHERE status='pending' AND send_at<=now()
+            ORDER BY send_at,id LIMIT %s''', (limit,)).fetchall()
+
+    def mark_scheduled(self, item_id, status, message_id=None):
+        self.conn.execute('''UPDATE scheduled_messages SET status=%s,message_id=COALESCE(%s,message_id),updated_at=now()
+            WHERE id=%s''', (status, message_id, item_id))
+
+    def retry_scheduled(self, item_id, seconds):
+        # Telegram certainly rejected or never received it, so another attempt is safe.
+        self.conn.execute('''UPDATE scheduled_messages SET status='pending',attempts=attempts+1,updated_at=now(),
+            send_at=now()+%s*interval '1 second' WHERE id=%s''', (max(1, seconds), item_id))
+
+    def delete_scheduled(self, item_id):
+        self.conn.execute('DELETE FROM scheduled_messages WHERE id=%s', (item_id,))
 
     def draft(self, chat_id, user_id):
         self.conn.execute('DELETE FROM personality_drafts WHERE expires_at <= now()')
