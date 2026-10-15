@@ -1,6 +1,6 @@
 import re
 import texts
-from recommendations import UNCONFIRMED_HEADING
+from recommendations import LABELS, UNCONFIRMED_HEADING
 
 ADMIN_COMMANDS = {'/images', '/voice', '/web', '/personality', '/context', '/historylimit', '/resetmemory', '/pause', '/resume', '/settings', '/menukey'}
 PUBLIC_COMMANDS = {'/help', '/whoami', '/chat', '/search', '/forgetme', '/skills'}
@@ -48,10 +48,14 @@ SHORTENED_NOTE = ('[Earlier bot reply, shortened in memory: details such as addr
                   'or say you no longer have them; do not reconstruct them from memory.]\n')
 # Card heading: "1. **Name**", or "1. ☕ **Name** — venue" in replies stored before free-form cards.
 CARD_HEAD = re.compile(r'\d+\. (?:\S+ )?\*\*(.+?)\*\*')
+OLD_CARD_HEAD = re.compile(r'\d+\. [^\s*]+ \*\*')
 UNCONFIRMED_ENTRY = re.compile(r'- (.+?)(?: — .*)?$')
 
 
 def card_names(lines):
+    # Bold numbered steps in a plain answer are not cards: new cards always carry an address, old ones an emoji.
+    if not any(line.startswith(LABELS['address']) or OLD_CARD_HEAD.match(line) for line in lines):
+        return []
     names = [match.group(1) for match in map(CARD_HEAD.match, lines) if match]
     if names and UNCONFIRMED_HEADING in lines:
         for line in lines[lines.index(UNCONFIRMED_HEADING) + 1:]:

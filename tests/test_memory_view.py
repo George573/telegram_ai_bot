@@ -33,6 +33,14 @@ class MemoryViewTests(unittest.TestCase):
     def test_fake_heading_in_text_is_not_a_name(self):
         self.assertNotIn('Не карточка', shorten_reply(NEW_CARD))
 
+    def test_bold_numbered_steps_are_not_cards(self):
+        text = ('Как начать.\n\n1. **Установка**\n' + 'Скачайте пакет и распакуйте. ' * 20 +
+                '\nДокументация: https://example.com/docs\n\n2. **Настройка**\n' + 'Заполните файл настроек. ' * 20)
+        short = shorten_reply(text)
+        self.assertTrue(short.startswith(SHORTENED_NOTE))
+        self.assertIn('Документация: https://example.com/docs', short)
+        self.assertNotIn('Earlier recommendations', short)
+
     def test_plain_text_keeps_opening_and_source_links(self):
         text = 'Начало ответа.\n' + 'Длинное объяснение строки.\n' * 60 + 'Источники:\nСайт: https://example.com/a'
         short = shorten_reply(text)
