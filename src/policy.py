@@ -1,5 +1,6 @@
 import re
 import texts
+from recommendations import UNCONFIRMED_HEADING
 
 ADMIN_COMMANDS = {'/images', '/voice', '/web', '/personality', '/context', '/historylimit', '/resetmemory', '/pause', '/resume', '/settings', '/menukey'}
 PUBLIC_COMMANDS = {'/help', '/whoami', '/chat', '/search', '/forgetme', '/skills'}
@@ -40,23 +41,34 @@ def compact_plan(rows, limit, slots=0):
 
 
 # Older long bot replies reach the model shortened; the newest ones stay whole for follow-up questions.
-KEEP_FULL_REPLIES = 2
+KEEP_FULL_REPLIES = 3
 SHORTEN_OVER = 800
-SHORTENED_NOTE = ('[Earlier bot reply, shortened in memory: explanations, review notes and caveats were left out. '
-                  'If someone asks about left-out details, check again with tools or say you no longer have them; '
-                  'do not reconstruct them from memory.]\n')
-# Card lines that are prose about an item rather than its facts (why, reviews, caveats, near-miss, gaps).
-PROSE_LINES = ('💡 ', '⭐ ', '⚠️ ', '↔ ', '❔ ')
-CARD_HEAD = re.compile(r'\d+\. \S+ \*\*')
+SHORTENED_NOTE = ('[Earlier bot reply, shortened in memory: details such as addresses, ratings, links, explanations '
+                  'and caveats were left out. If someone asks about left-out details, look them up again with tools '
+                  'or say you no longer have them; do not reconstruct them from memory.]\n')
+# Card heading: "1. **Name**", or "1. ☕ **Name** — venue" in replies stored before free-form cards.
+CARD_HEAD = re.compile(r'\d+\. (?:\S+ )?\*\*(.+?)\*\*')
+UNCONFIRMED_ENTRY = re.compile(r'- (.+?)(?: — .*)?$')
+
+
+def card_names(lines):
+    names = [match.group(1) for match in map(CARD_HEAD.match, lines) if match]
+    if names and UNCONFIRMED_HEADING in lines:
+        for line in lines[lines.index(UNCONFIRMED_HEADING) + 1:]:
+            match = UNCONFIRMED_ENTRY.match(line)
+            if not match:
+                break
+            names.append(match.group(1))
+    return names
 
 
 def shorten_reply(text):
-    """Facts a follow-up may need (names, times, prices, addresses, links), without the prose around them."""
+    """Card replies keep only the place names; plain replies keep their opening and every later line with a link."""
     lines = text.split('\n')
-    if any(CARD_HEAD.match(line) for line in lines):
-        kept = [line for line in lines if not line.startswith(PROSE_LINES)]
+    names = card_names(lines)
+    if names:
+        short = '[Earlier recommendations: ' + ', '.join(names) + ']'
     else:
-        # Plain text: the opening up to a line boundary, plus every later line with a link.
         opening, size = [], 0
         for line in lines:
             if size + len(line) > SHORTEN_OVER // 2:
@@ -64,8 +76,7 @@ def shorten_reply(text):
             opening.append(line)
             size += len(line) + 1
         links = [line for line in lines[len(opening):] if 'http' in line]
-        kept = opening + ['…'] + links
-    short = re.sub(r'\n{3,}', '\n\n', '\n'.join(kept)).strip()
+        short = re.sub(r'\n{3,}', '\n\n', '\n'.join(opening + ['…'] + links)).strip()
     return SHORTENED_NOTE + short if len(short) + len(SHORTENED_NOTE) < len(text) - 300 else text
 
 
