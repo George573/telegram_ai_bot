@@ -595,10 +595,11 @@ class Model:
                     'add facts. Return the corrected place_recommendations JSON object only.',
                     history, output_tokens, recommendations.FORMAT, False, image, False,
                     skill_enabled=False, continuation=repair).text.strip()
-        text, dropped, removed = recommendations.render(value, evidence, max_chars or 3500, excluded_names)
-        event('recommendations_rendered', **fields, result_count=len(value['items']) - removed,
-              dropped_links=dropped, dropped_items=removed)
-        return ModelText(text, sources[:3], cards=bool(value['items']))
+        result = recommendations.render(value, evidence, max_chars or 3500, excluded_names)
+        event('recommendations_rendered', **fields, result_count=result.cards, dropped_links=result.dropped_links,
+              dropped_items=result.dropped_items, demoted_items=result.demoted_items,
+              unconfirmed_count=result.unconfirmed)
+        return ModelText(result.text, sources[:3], cards=bool(result.cards))
 
     def _tool_batch_error(self, calls, allowed_tools):
         if not allowed_tools:

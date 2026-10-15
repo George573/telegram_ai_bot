@@ -163,23 +163,21 @@ class ModelLoopTests(unittest.TestCase):
         found = maps.normalized_search(maps.search_url('кофейня Никольская'), NIKOLSKAYA, exclude_chains=True)
         search = ToolCall('m', 'read_yandex_maps_search', '{"query":"кофейня Никольская","exclude_chains":true}')
         load = ToolCall('s', 'load_skill', '{"name":"nearby-places"}')
-        answer = json.dumps({'intro': 'Несетевые кофейни на Никольской', 'follow_up': None, 'evidence_gaps': None, 'items': [
-            {'kind': 'cafe', 'name': 'Кофеин', 'venue': 'Площадь Революции', 'address': 'Никольская ул., 11-13с5',
-             'when': None, 'price': None, 'why': 'Своя обжарка', 'reviews': None, 'caveats': None, 'relaxed': None,
-             'links': ['https://yandex.ru/maps/org/176224105875/reviews/']},
-            {'kind': 'cafe', 'name': 'Surf Coffee', 'venue': None, 'address': None, 'when': None, 'price': None,
-             'why': 'Сетевая, но хорошая', 'reviews': None, 'caveats': None, 'relaxed': None,
+        answer = json.dumps({'intro': 'Несетевые кофейни на Никольской', 'unconfirmed': [], 'outro': None, 'items': [
+            {'name': 'Кофеин', 'address': 'Никольская ул., 11-13с5', 'rating': None, 'when': None,
+             'text': 'Своя обжарка', 'links': ['https://yandex.ru/maps/org/176224105875/reviews/']},
+            {'name': 'Surf Coffee', 'address': None, 'rating': None, 'when': None, 'text': 'Сетевая, но хорошая',
              'links': ['https://yandex.ru/maps/org/161860189832/reviews/', 'https://surfcoffee.ru/']}]})
         with patch.object(model, '_generation_attempt', side_effect=[Generation('', True, tool_calls=(load, search)),
                 Generation(answer, True)]) as generate, patch('model.read_maps_search', return_value=found) as read:
             text = model.generate('Persona', [], allow_search=True)
         read.assert_called_once_with('кофейня Никольская', True, model.config.tools_url)
-        self.assertIn('🔗 https://yandex.ru/maps/org/176224105875/reviews', text)
+        self.assertIn('\nhttps://yandex.ru/maps/org/176224105875/reviews', text)
         # The chain was excluded by the tool, so its card is removed entirely, links included.
         self.assertNotIn('Surf Coffee', text)
         self.assertNotIn('161860189832', text)
         self.assertNotIn('surfcoffee.ru', text)
-        self.assertIn('1. ☕ **Кофеин**', text)
+        self.assertIn('1. **Кофеин**', text)
         result = json.loads(generate.call_args.kwargs['continuation'][-1]['content'])
         self.assertNotIn('Surf Coffee', [r['name'] for r in result['results']])
 
@@ -208,16 +206,6 @@ class SkillAndCardTests(unittest.TestCase):
             self.assertLess(len(body), 8000)
         self.assertLess(len(skill_registry.catalog()), 3000)
         self.assertIn('read_yandex_maps_search', skill_registry.instructions('nearby-places'))
-
-    def test_near_miss_is_labelled(self):
-        value = rec.validate({'intro': 'x', 'follow_up': None, 'evidence_gaps': None, 'items': [
-            {'kind': 'cafe', 'name': 'A', 'venue': None, 'address': None, 'when': None, 'price': None, 'why': 'y',
-             'reviews': None, 'caveats': None, 'relaxed': '7 минут от Никольской', 'links': []}]})
-        self.assertIn('↔ 7 минут от Никольской', rec.render(value, set())[0])
-        legacy = rec.validate({'intro': 'x', 'follow_up': None, 'evidence_gaps': None, 'items': [
-            {'kind': 'cafe', 'name': 'A', 'venue': None, 'address': None, 'when': None, 'price': None, 'why': 'y',
-             'reviews': None, 'caveats': None, 'links': []}]})
-        self.assertIsNone(legacy['items'][0]['relaxed'])
 
 
 if __name__ == '__main__':

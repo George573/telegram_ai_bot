@@ -42,7 +42,7 @@ NUMBERS = frozenset({'duration_ms', 'input_tokens', 'output_tokens', 'search_cal
                      'update_id', 'status_code', 'retry_after', 'attempt', 'delay_ms', 'error_position',
                      'error_line', 'error_column', 'output_chars', 'repair_attempt', 'max_repairs', 'query_chars', 'result_count',
                      'tool_call_count', 'argument_chars', 'returned_chars', 'model_rounds', 'review_count',
-                     'failure_count', 'dropped_links', 'kept_links', 'dropped_items', 'reasoning_tokens', 'model_requests', 'failed_requests',
+                     'failure_count', 'dropped_links', 'kept_links', 'dropped_items', 'demoted_items', 'unconfirmed_count', 'reasoning_tokens', 'model_requests', 'failed_requests',
                      'searches', 'reader_calls', 'reader_ok', 'skills_loaded', 'json_repairs'})
 AMOUNTS = frozenset({'reserved_usd', 'charged_usd', 'budget_usd', 'spent_usd'})
 OUTCOMES = frozenset({'accepted', 'refused', 'delivered', 'silent', 'fallback_delivered', 'paused', 'not_directed', 'rate_limited',

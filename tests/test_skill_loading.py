@@ -40,9 +40,9 @@ SEARCH_CALL = ('search_web', '{"query":"public cafe","site":null,"recency":null}
 
 def cards(name='Cafe', link='https://example.com/cafe'):
     """A valid place_recommendations answer."""
-    return json.dumps({'intro': 'Here you go', 'follow_up': None, 'evidence_gaps': None, 'items': [
-        {'kind': 'cafe', 'name': name, 'venue': None, 'address': None, 'when': None, 'price': None,
-         'why': 'Matches the request', 'reviews': None, 'caveats': None, 'links': [link]}]})
+    return json.dumps({'intro': 'Here you go', 'unconfirmed': [], 'outro': None, 'items': [
+        {'name': name, 'address': 'Synthetic st., 1', 'rating': None, 'when': None,
+         'text': 'Matches the request', 'links': [link]}]})
 
 
 class SkillLoadingTests(unittest.TestCase):
