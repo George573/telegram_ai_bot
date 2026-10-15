@@ -3,6 +3,7 @@ from email.message import Message
 from io import BytesIO
 import json
 from pathlib import Path
+import re
 import sys
 import unittest
 import urllib.error
@@ -206,6 +207,14 @@ class SkillAndCardTests(unittest.TestCase):
             self.assertLess(len(body), 8000)
         self.assertLess(len(skill_registry.catalog()), 3000)
         self.assertIn('read_yandex_maps_search', skill_registry.instructions('nearby-places'))
+
+    def test_skills_name_only_current_schema_fields(self):
+        removed = {'kind', 'venue', 'price', 'why', 'reviews', 'caveats', 'relaxed', 'follow_up', 'evidence_gaps'}
+        for name in skill_registry.SKILL_NAMES:
+            with self.subTest(skill=name):
+                used = set(re.findall(r'`([a-z_]+)(?:\[\])?`', skill_registry.instructions(name)))
+                self.assertFalse(used & removed)
+                self.assertLessEqual({'items', 'text', 'unconfirmed'}, used)
 
 
 if __name__ == '__main__':
