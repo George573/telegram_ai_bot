@@ -6,7 +6,7 @@ Recommendation cards (`place_recommendations`) are too rigid: every item must fi
 renders each with a fixed emoji row (📅 💳 📍 💡 ⭐ ⚠️ ↔ 🔗). That makes answers bulky, pushes the model to
 invent filler for rows it has no evidence for, and leaves the persona's voice only in `intro`/`follow_up`.
 
-The bot should enforce only the facts that make a card trustworthy (name, address, rating, grounded links) and let the model write the rest of each card freely, in the persona's voice.
+The bot should enforce only the facts that make a card trustworthy (name, address, rating, timing, grounded links) and let the model write the rest of each card freely, in the persona's voice.
 
 ## Decisions
 
@@ -26,9 +26,9 @@ items[]      0–5 (MAX_ITEMS)
   name       string, required, nonempty, ≤120
   address    string | null, ≤200                        from a tool result
   rating     string | null, ≤100                        e.g. "4,8 (312 оценок)" / "Афиша 8,9 (1526)"
-  text       string, required, nonempty, ≤600           free Markdown: why it fits, hours or event dates,
-                                                         price, caveats, near-miss note, own emoji —
-                                                         only what evidence supports
+  when       string | null, ≤200                        hours for the needed day, or event dates/sessions
+  text       string, required, nonempty, ≤600           free Markdown: why it fits, price, caveats,
+                                                         near-miss note, own emoji — only what evidence supports
   links      string[], ≤3, each ≤400
 unconfirmed[] 0–3
   name       string, required, nonempty, ≤120
@@ -36,8 +36,8 @@ unconfirmed[] 0–3
 outro        string | null, ≤300                        persona voice; replaces follow_up and evidence_gaps
 ```
 
-Removed: `kind` (and `KINDS`, `ICONS`), `venue`, `when`, `price`, `why`, `reviews`, `caveats`, `relaxed`,
-`follow_up`, `evidence_gaps`. Metro/distance goes into `address` or `text`; hours, event dates and price into `text`.
+Removed: `kind` (and `KINDS`, `ICONS`), `venue`, `price`, `why`, `reviews`, `caveats`, `relaxed`,
+`follow_up`, `evidence_gaps`. Metro/distance goes into `address` or `text`; price into `text`.
 
 All keys are required (OpenAI strict mode needs that); nullable fields use `null`. String lengths are
 validated locally as today (`strict_schema` strips them for OpenAI). For JSON-mode providers (Z.ai),
@@ -63,13 +63,14 @@ loop in `model.py` is unchanged.
 1. **Name**
 Адрес: …            (always present: a card without an address is demoted)
 Рейтинг: …          (omitted if null)
+Когда: …            (omitted if null)
 <model text, line breaks kept>
 <grounded links, space-separated>
 ```
 
-   `name`, `address`, `rating` and `note` stay one-line (`clean`). `text` keeps line breaks
+   `name`, `address`, `rating`, `when` and `note` stay one-line (`clean`). `text` keeps line breaks
    (collapsed to at most single blank lines). To stop text faking structure, any `text` line that would
-   match a card heading (`N. **`) or starts with a fact label (`Адрес:`, `Рейтинг:`) or the
+   match a card heading (`N. **`) or starts with a fact label (`Адрес:`, `Рейтинг:`, `Когда:`) or the
    unconfirmed heading has that prefix neutralised (numbering removed / label prefixed with `– `).
 5. Unconfirmed block, after the cards:
 
@@ -95,8 +96,9 @@ Fixed rules, no AI request.
 
 - The three newest bot replies stay whole (`KEEP_FULL_REPLIES` 2 → 3).
 - Older long card replies (new or old stored format, detected by `\d+\. (\S+ )?\*\*` headings) become a
-  brief: the intro line plus `[Earlier recommendations: Name1, Name2, …]` (card names, then unconfirmed
-  names). Facts, links and text are dropped.
+  brief holding only the place names: `[Earlier recommendations: Name1, Name2, …]` (card names, then
+  unconfirmed names). Intro, facts, links and text are dropped; the surrounding conversation already says
+  where and what was asked.
 - Older long plain replies keep today's rule (opening plus lines with links).
 - `SHORTENED_NOTE` is reworded: details such as addresses, ratings and links were left out; if asked, look the
   place up again with tools rather than reconstruct it. `PROSE_LINES` is removed.
@@ -130,8 +132,8 @@ and any other test building `place_recommendations` JSON. New/changed tests:
   structure-faking lines in `text` neutralised; item without address demoted; item whose links are all
   ungrounded demoted; unconfirmed block rendering and cap of 3; excluded chains removed from both lists;
   `cards` false when everything was demoted; trailing-card truncation.
-- memory: three newest replies kept whole; older new-format and old-format card replies become intro +
-  name list; plain replies unchanged.
+- memory: three newest replies kept whole; older new-format and old-format card replies become a
+  name-only list; plain replies unchanged.
 - skills: every `SKILL.md` mentions only fields that exist in the schema.
 
 All tests use synthetic data and mocked network calls; no bot run, no live requests.
