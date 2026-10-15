@@ -54,6 +54,9 @@ loop in `model.py` is unchanged.
 
 1. Remove items and unconfirmed entries whose name matches an excluded chain (same rule as today).
 2. Ground each item's links against `evidence` (as today; unknown links are dropped and counted).
+   URLs the model writes inside `intro`, `text`, `note` and `outro` are grounded the same way with
+   `ground_links` (a Markdown link keeps its label, an unknown bare URL is removed) and added to the
+   dropped-link count, so free text cannot carry invented links.
 3. Demote: an item with an empty/null `address` or no grounded link moves to the unconfirmed list
    (its `text` is dropped, no note). Demoted entries go after the model's own unconfirmed entries; the
    combined list is capped at 3.
@@ -68,8 +71,8 @@ loop in `model.py` is unchanged.
 <grounded links, space-separated>
 ```
 
-   `name`, `address`, `rating`, `when` and `note` stay one-line (`clean`). `text` keeps line breaks
-   (collapsed to at most single blank lines). To stop text faking structure, any `text` line that would
+   `name`, `address`, `rating`, `when` and `note` stay one-line (`clean`). `text` keeps single line breaks;
+   blank lines inside it are collapsed so a card never contains an empty line. To stop text faking structure, any `text` line that would
    match a card heading (`N. **`) or starts with a fact label (`Адрес:`, `Рейтинг:`, `Когда:`) or the
    unconfirmed heading has that prefix neutralised (numbering removed / label prefixed with `– `).
 5. Unconfirmed block, after the cards:
@@ -84,7 +87,8 @@ loop in `model.py` is unchanged.
    until it fits `max_chars` (as today).
 7. `ModelText.cards` is true when at least one card is rendered (buttons appear only then).
 
-The return value grows a demoted count: `render` returns `(text, dropped_links, dropped_items, demoted_items)`.
+`render` returns a `Rendered` namedtuple: `text`, `cards` (cards shown after truncation), `unconfirmed`
+(entries shown), `dropped_links`, `dropped_items`, `demoted_items`.
 `recommendations_rendered` logs `result_count` (cards shown), `dropped_links`, `dropped_items`,
 `demoted_items` and `unconfirmed_count`; the new names are added to the observability allowlist.
 
