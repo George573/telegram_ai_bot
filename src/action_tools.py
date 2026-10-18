@@ -84,3 +84,6 @@ CANCEL_SCHEDULED = {'name': 'cancel_scheduled_message',
 TOOLS = (SEND_POLL, SCHEDULE_MESSAGE, LIST_SCHEDULED, CANCEL_SCHEDULED)
 NAMES = frozenset(tool['name'] for tool in TOOLS)
 KEYS = {tool['name']: frozenset(tool['parameters']['properties']) for tool in TOOLS}
+# Nullable fields a model may leave out: providers without strict schemas (Z.ai) often do.
+OPTIONAL = {tool['name']: frozenset(key for key, value in tool['parameters']['properties'].items()
+                                    if 'null' in value.get('type', ())) for tool in TOOLS}

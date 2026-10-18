@@ -128,7 +128,6 @@ class ChatActionTests(unittest.TestCase):
             (poll(question='x' * 301), 'question', '301 characters'),
             (poll(type='quiz'), 'correct_option_index', '0 to 1'),
             (poll(type='quiz', correct_option_index=1, allows_multiple_answers=True), 'allows_multiple_answers', 'one right answer'),
-            (poll(correct_option_index=0), 'correct_option_index', 'quizzes only'),
             (poll(send_at='2026-10-12T09:00', delay_minutes=5), 'send_at', 'only one'),
         ]
         for arguments, field, hint in cases:
@@ -142,14 +141,58 @@ class ChatActionTests(unittest.TestCase):
         self.assertEqual(self.telegram.polls, [])
         self.assertEqual(self.store.rows, [])
 
+    def test_regular_poll_ignores_quiz_fields(self):
+        # Z.ai does not enforce the schema; a stray 0 or text here must not block an ordinary vote.
+        for overrides in ({'correct_option_index': 0}, {'correct_option_index': -1}, {'explanation': 'Почему'}):
+            with self.subTest(**overrides):
+                self.store.rows.clear()
+                self.telegram.polls.clear()
+                result = self.call('send_poll', poll(question=f'Куда идём {overrides}?', **overrides))
+                self.assertEqual(result['status'], 'ok')
+                self.assertNotIn('correct_option_id', self.telegram.polls[0][1])
+                self.assertNotIn('explanation', self.telegram.polls[0][1])
+
+    def test_poll_for_now_is_posted_at_once(self):
+        # "Now" written as a zero delay or an empty time is still an immediate poll, not an error.
+        for overrides in ({'delay_minutes': 0}, {'send_at': ''}):
+            with self.subTest(**overrides):
+                self.store.rows.clear()
+                self.telegram.polls.clear()
+                result = self.call('send_poll', poll(question=f'Куда идём {overrides}?', **overrides))
+                self.assertEqual(result['status'], 'ok')
+                self.assertTrue(result['posted'])
+                self.assertEqual(len(self.telegram.polls), 1)
+
+    def test_poll_time_errors_explain_how_to_post_now(self):
+        result = self.call('send_poll', poll(send_at='2026-10-11T15:00'))  # NOW in Moscow
+        self.assertEqual(result['field'], 'send_at')
+        self.assertIn('set both send_at and delay_minutes to null', result['message'])
+        # Reminders have no "now": the hint is only for polls.
+        result = self.call('schedule_message', json.dumps({'text': 'hi', 'send_at': '2026-10-11T15:00',
+                                                           'delay_minutes': None}))
+        self.assertNotIn('to null', result['message'])
+
+    def test_missing_optional_fields_count_as_null(self):
+        arguments = json.loads(poll())
+        for field in ('correct_option_index', 'explanation', 'send_at', 'delay_minutes'):
+            del arguments[field]
+        result = self.call('send_poll', json.dumps(arguments, ensure_ascii=False))
+        self.assertEqual(result['status'], 'ok')
+        self.assertTrue(result['posted'])
+        result = self.call('schedule_message', json.dumps({'text': 'Напоминаю', 'delay_minutes': 20}))
+        self.assertEqual(result['status'], 'ok')
+
     def test_malformed_or_incomplete_arguments_are_explained(self):
         result = self.call('schedule_message', '{"text": "hi", ')
         self.assertEqual(result['error'], 'malformed_arguments')
         self.assertIn('valid JSON', result['message'])
-        result = self.call('schedule_message', '{"text": "hi", "when": "soon"}')
+        result = self.call('schedule_message', '{"message": "hi", "when": "soon"}')
         self.assertEqual(result['error'], 'invalid_arguments')
-        self.assertIn('Missing: delay_minutes, send_at', result['message'])
-        self.assertIn('Unknown: when', result['message'])
+        self.assertIn('Missing: text', result['message'])
+        self.assertIn('Unknown: message, when', result['message'])
+        # A reminder with no time is still refused with a fix, not silently sent now.
+        result = self.call('schedule_message', '{"text": "hi"}')
+        self.assertEqual(result['field'], 'send_at')
 
     def test_telegram_rejection_is_returned_so_the_model_can_fix_it(self):
         self.telegram.failures = [TelegramFailure(400, description='Bad Request: poll question length must not exceed 255')]

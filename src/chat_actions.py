@@ -11,7 +11,7 @@ import logging
 import re
 from observability import event
 from telegram_api import TelegramFailure
-from action_tools import (ACTION_LIMITS, KEYS, MAX_DELIVERY_ATTEMPTS, MAX_PENDING_PER_CHAT, MAX_SCHEDULE_DAYS,
+from action_tools import (ACTION_LIMITS, KEYS, OPTIONAL, MAX_DELIVERY_ATTEMPTS, MAX_PENDING_PER_CHAT, MAX_SCHEDULE_DAYS,
                           MAX_TEXT_CHARS, MIN_LEAD_SECONDS, MOSCOW, NAMES, POLL_EXPLANATION_CHARS, POLL_MAX_OPTIONS,
                           POLL_MIN_OPTIONS, POLL_OPTION_CHARS, POLL_QUESTION_CHARS)
 
@@ -68,16 +68,27 @@ def clean_text(value, field, limit, *, minimum=1):
     return value
 
 
-def send_time(send_at, delay_minutes, now, *, required):
-    """When to send: None for immediately (polls only), else an aware datetime inside the allowed window."""
+def poll_time(send_at, delay_minutes, now):
+    """None to post now, else the scheduled time; a zero delay or an empty time is how models often write "now"."""
+    send_at = None if isinstance(send_at, str) and not send_at.strip() else send_at
+    delay_minutes = None if type(delay_minutes) is int and delay_minutes == 0 else delay_minutes
+    if send_at is None and delay_minutes is None:
+        return None
+    try:
+        return send_time(send_at, delay_minutes, now)
+    except ActionError as error:
+        error.message += ' To post the poll now instead, set both send_at and delay_minutes to null.'
+        raise
+
+
+def send_time(send_at, delay_minutes, now):
+    """An aware datetime inside the allowed window; exactly one of send_at or delay_minutes is set."""
     if send_at is not None and delay_minutes is not None:
         raise ActionError('invalid_arguments', 'Set only one of send_at or delay_minutes; make the other null.',
                           'send_at')
     if send_at is None and delay_minutes is None:
-        if required:
-            raise ActionError('invalid_arguments', 'Set send_at (Moscow "YYYY-MM-DDTHH:MM") or delay_minutes. '
-                              'If the user gave no time, ask them when instead of calling this tool.', 'send_at')
-        return None
+        raise ActionError('invalid_arguments', 'Set send_at (Moscow "YYYY-MM-DDTHH:MM") or delay_minutes. '
+                          'If the user gave no time, ask them when instead of calling this tool.', 'send_at')
     if delay_minutes is not None:
         if type(delay_minutes) is not int or not 1 <= delay_minutes <= MAX_SCHEDULE_DAYS * 1440:
             raise ActionError('invalid_arguments', 'delay_minutes must be a whole number from 1 to '
@@ -123,10 +134,7 @@ def poll_content(arguments):
     content = {'question': question, 'options': options, 'type': kind,
                'is_anonymous': arguments['is_anonymous'], 'allows_multiple_answers': arguments['allows_multiple_answers']}
     if kind == 'regular':
-        if correct is not None or explanation not in (None, ''):
-            raise ActionError('invalid_arguments', 'correct_option_index and explanation are for quizzes only; '
-                              'set them to null or use type "quiz".', 'correct_option_index')
-        return content
+        return content  # Quiz-only fields are ignored, never a reason to block an ordinary vote.
     if arguments['allows_multiple_answers']:
         raise ActionError('invalid_arguments', 'A quiz has exactly one right answer: set allows_multiple_answers '
                           'to false, or use type "regular".', 'allows_multiple_answers')
@@ -175,6 +183,8 @@ class ChatActions:
             except (TypeError, ValueError):
                 raise ActionError('malformed_arguments', 'The arguments were not valid JSON. Send one JSON object '
                                   'with exactly the fields of the tool schema.') from None
+            if isinstance(arguments, dict):
+                arguments = {**dict.fromkeys(OPTIONAL[name]), **arguments}
             if not isinstance(arguments, dict) or set(arguments) != KEYS[name]:
                 missing = sorted(KEYS[name] - set(arguments)) if isinstance(arguments, dict) else []
                 extra = sorted(set(arguments) - KEYS[name]) if isinstance(arguments, dict) else []
@@ -207,7 +217,7 @@ class ChatActions:
     def send_poll(self, arguments):
         content = poll_content(arguments)
         now = self.clock()
-        when = send_time(arguments['send_at'], arguments['delay_minutes'], now, required=False)
+        when = poll_time(arguments['send_at'], arguments['delay_minutes'], now)
         if when is not None:
             row, _ = self._schedule('poll', content, when, 'send_poll', arguments)
             return result('ok', scheduled_id=row['id'], send_at=moscow_text(row['send_at']),
@@ -238,7 +248,7 @@ class ChatActions:
 
     def schedule_message(self, arguments):
         text = clean_text(arguments['text'], 'text', MAX_TEXT_CHARS)
-        when = send_time(arguments['send_at'], arguments['delay_minutes'], self.clock(), required=True)
+        when = send_time(arguments['send_at'], arguments['delay_minutes'], self.clock())
         row, created = self._schedule('text', {'text': text}, when, 'schedule_message', arguments)
         return result('ok', scheduled_id=row['id'], send_at=moscow_text(row['send_at']),
                       **({} if created else {'notice': 'Already scheduled for this request; not duplicated.'}))
