@@ -147,7 +147,10 @@ class SkillLoadingTests(unittest.TestCase):
                     self.assertEqual(result['role'], 'tool')
                     self.assertEqual(result['content'], skill_body())
                     self.assertEqual(bodies[1]['messages'][-3]['reasoning_content'], 'Synthetic reasoning')
-                    self.assertEqual(bodies[0]['response_format'], bodies[1]['response_format'])
+                    # Both rounds offer tools, so neither uses JSON mode; the schema stays in the instructions.
+                    self.assertNotIn('response_format', bodies[0])
+                    self.assertNotIn('response_format', bodies[1])
+                    self.assertIn('"respond"', bodies[1]['messages'][0]['content'])
                 # load_skill stays offered for the other skill; this one is never re-read (load called once).
                 self.assertIn('load_skill', json.dumps(bodies[1]['tools']))
 
@@ -260,3 +263,25 @@ class SkillLoadingTests(unittest.TestCase):
                 load.assert_called_once_with('nearby-places')
                 self.assertEqual(len(requests), 6)
                 self.assertEqual(len(model.store.charges), 6)
+
+    def test_zai_research_after_skill_offers_tools_without_json_mode(self):
+        # Z.ai JSON mode plus "return only JSON" made glm-5.3-flash skip every tool and write cards at once.
+        bodies = []
+        def handler(request):
+            bodies.append(json.loads(request.content))
+            if len(bodies) == 1:
+                return self.response('zai', call=('load_skill', '{"name":"nearby-places"}'))
+            if len(bodies) == 2:
+                return self.response('zai', call=SEARCH_CALL)
+            return self.response('zai', text=cards())
+        model = self.model('zai', handler)
+        model.config = replace(model.config, model='glm-5.3-flash')
+        answer = model.generate('Cat', [{'role': 'user', 'content': 'Find a cafe'}], allow_search=True)
+        self.assertIn('**Cafe**', answer)
+        self.assertEqual(len(bodies), 3)
+        for body in bodies[1:]:
+            self.assertIn('tools', body)
+            self.assertNotIn('response_format', body)
+            self.assertNotIn('Format requirement', json.dumps(body['messages'], ensure_ascii=False))
+            # The model still sees the card shape it must use for the final answer.
+            self.assertIn('"unconfirmed"', body['messages'][0]['content'])

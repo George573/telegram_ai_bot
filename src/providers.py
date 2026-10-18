@@ -342,7 +342,8 @@ class ZaiProvider:
 
     def prepare_instructions(self, instructions, response_format):
         if response_format:
-            instructions += '\nReturn only a JSON object matching this schema:\n' + json.dumps(response_format['schema'])
+            instructions += ('\nYour final answer, after any tool calls, must be only a JSON object matching this '
+                             'schema:\n' + json.dumps(response_format['schema']))
         return instructions
 
     def generate(self, *, model, instructions, history, output_tokens,
@@ -362,16 +363,18 @@ class ZaiProvider:
         if allow_search or skill_enabled or actions_enabled:
             instructions += ('\nYou may call multiple functions in one response; each call receives a result. For explicit public lookup call search_web '
                 '(not a function named web_search). After load_skill returns its instructions, do not load it again.')
-        if response_format:
+        # JSON mode only when no tools are offered: with it, glm models write the JSON answer at once
+        # and never call a tool. Shared Model validation and repair still check the resulting object.
+        json_mode = bool(response_format) and not tools
+        if json_mode:
             # Z.ai supports JSON mode, not OpenAI's strict schema format.
-            # Shared Model validation still checks the resulting object.
             extra['response_format'] = {'type': 'json_object'}
         messages = [{'role': 'system', 'content': instructions}] + history + list(continuation)
         extra_body = {'thinking': {'type': 'enabled' if model in THINKING_MODELS else 'disabled'}}
         if model in THINKING_MODELS:
             # This model requires thinking; low effort keeps it inside token_ceiling().
             extra_body['reasoning_effort'] = 'low'
-        if response_format and model in THINKING_MODELS:
+        if json_mode and model in THINKING_MODELS:
             # Keep formatting authoritative after conversational role-play and
             # distinguish an instance of the requested schema from the schema.
             messages.append({'role': 'system', 'content':

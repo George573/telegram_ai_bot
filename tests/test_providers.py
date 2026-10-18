@@ -131,12 +131,14 @@ class ProviderTests(unittest.TestCase):
             self.assertEqual(body['thinking'], {'type': 'enabled'})
             self.assertEqual(body['reasoning_effort'], 'low')
             self.assertEqual(body['max_tokens'], 600 + THINKING_ALLOWANCE)
-            self.assertEqual(body['response_format'], {'type': 'json_object'})
-            self.assertEqual(body['messages'][-1]['role'], 'system')
-            self.assertIn('not the schema itself', body['messages'][-1]['content'])
             if len(requests) == 1:
-                self.assertEqual(body['messages'][-2]['content'], 'Hello, Cat!')
+                # Tools are offered: JSON mode would make the model skip them.
+                self.assertNotIn('response_format', body)
+                self.assertEqual(body['messages'][-1]['content'], 'Hello, Cat!')
             else:
+                self.assertEqual(body['response_format'], {'type': 'json_object'})
+                self.assertEqual(body['messages'][-1]['role'], 'system')
+                self.assertIn('not the schema itself', body['messages'][-1]['content'])
                 self.assertEqual(body['messages'][-3], {'role': 'assistant', 'content': 'plain reply'})
                 self.assertIn('expected_value', body['messages'][-2]['content'])
             content = 'plain reply' if len(requests) == 1 else '{"respond":true,"reply":"Hello"}'

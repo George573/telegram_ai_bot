@@ -181,7 +181,8 @@ class SearchTests(unittest.TestCase):
                 return httpx.Response(200, json={'search_result': [
                     {'title': 'Cafe', 'link': 'https://example.com/cafe', 'content': 'Public evidence'}]})
             generations.append(body)
-            self.assertEqual(body['response_format'], {'type': 'json_object'})
+            # JSON mode only once tools are gone: the final answer and its repair.
+            self.assertEqual(body.get('response_format'), None if 'tools' in body else {'type': 'json_object'})
             if len(generations) <= 5:
                 return self.tool_response('search_web', '{"query":"public cafes"}', f'call{len(generations)}')
             self.assertNotIn('tools', body)
@@ -395,7 +396,7 @@ class SearchTests(unittest.TestCase):
                 return httpx.Response(200, json={'search_result': [
                     {'title': 'Fact', 'link': 'https://example.com/fact'}, {'title': 'Bad', 'link': 'http://10.0.0.1/'}]})
             generations.append(body)
-            self.assertEqual(body['response_format'], {'type': 'json_object'})
+            self.assertEqual(body.get('response_format'), None if 'tools' in body else {'type': 'json_object'})
             self.assertNotIn(_load_skill_body('nearby-places'), body['messages'][0]['content'])
             if len(generations) == 1:
                 self.assertEqual(body['tools'][0]['function']['name'], 'load_skill')
