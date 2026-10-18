@@ -47,7 +47,8 @@ NUMBERS = frozenset({'duration_ms', 'input_tokens', 'output_tokens', 'search_cal
 AMOUNTS = frozenset({'reserved_usd', 'charged_usd', 'budget_usd', 'spent_usd'})
 OUTCOMES = frozenset({'accepted', 'refused', 'delivered', 'silent', 'fallback_delivered', 'paused', 'not_directed', 'rate_limited',
                       'cooldown', 'revoked', 'media_failed', 'media_disabled', 'throttled', 'delivery_failed',
-                      'delivery_unknown', 'gave_up', 'memory_failed', 'model_failed', 'budget_exceeded'})
+                      'delivery_unknown', 'gave_up', 'memory_failed', 'model_failed', 'budget_exceeded',
+                      'location_saved'})
 FALLBACKS = frozenset({'model_failure', 'budget', 'media_failed', 'memory', 'search_failed', 'settings_failed',
                        'search_disabled', 'invalid_request'})
 MODELS = frozenset(model for models in PRICES.values() for model in models) | frozenset(VISION_PRICES) | {'glm-asr-2512', 'gpt-transcribe'}

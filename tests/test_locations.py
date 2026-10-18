@@ -5,6 +5,9 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 from policy import location_line, normalize
+from config import Config
+from service import Service
+from test_service import FakeModel, FakeTelegram, MemoryStore
 
 BOT = {'id': 99, 'username': 'Cat'}
 
@@ -52,6 +55,50 @@ class ParseTests(unittest.TestCase):
                                    reply_to_message={'message_id': 3, 'from': {'id': 99}}), {-1}, BOT)
         self.assertFalse(located['directed'])
         self.assertIsNone(located['reply_to_message_id'])
+
+
+class StorageTests(unittest.TestCase):
+    def setUp(self):
+        self.store, self.tg, self.model = MemoryStore(), FakeTelegram(), FakeModel()
+        self.service = Service(Config('fake-telegram', 'fake-openai', frozenset({-1})), self.store, self.tg, self.model)
+
+    def send(self, update_id, **message):
+        edited = message.pop('edited', False)
+        self.service.accept(update_id, normalize({**update(edited, **message), 'update_id': update_id}, {-1}, BOT))
+        while self.service.process_one() is not None:
+            pass
+
+    def test_location_is_stored_silently_in_every_mode(self):
+        for mode in ('directed', 'all'):
+            with self.subTest(mode=mode):
+                self.store.rows.clear()
+                self.store.chat['mode'] = mode
+                self.send(1, location={'latitude': 55.7312, 'longitude': 37.6363})
+                self.assertEqual([r['content'] for r in self.store.rows], ['Speaker 10: [Location 55.73120,37.63630]'])
+                self.assertEqual((self.tg.sent, self.model.calls), ([], []))
+
+    def test_paused_chat_ignores_locations(self):
+        self.store.chat['paused'] = True
+        self.send(1, location={'latitude': 55.7, 'longitude': 37.6})
+        self.assertEqual(self.store.rows, [])
+
+    def test_live_updates_rewrite_their_own_line(self):
+        self.send(1, location={'latitude': 55.70, 'longitude': 37.60, 'live_period': 900})
+        self.send(2, edited=True, location={'latitude': 55.71, 'longitude': 37.61, 'live_period': 900})
+        self.send(3, edited=True, location={'latitude': 55.72, 'longitude': 37.62})
+        self.assertEqual([r['content'] for r in self.store.rows], ['Speaker 10: [Live location 55.72000,37.62000]'])
+        self.assertEqual(self.tg.sent, [])
+
+    def test_edit_without_a_stored_line_is_ignored(self):
+        self.send(1, edited=True, location={'latitude': 55.71, 'longitude': 37.61, 'live_period': 900})
+        self.assertEqual(self.store.rows, [])
+
+    def test_location_reply_to_a_bot_prompt_is_only_stored(self):
+        self.store.save_prompt(-1, 3, 10, '/chat')
+        self.send(1, location={'latitude': 55.7, 'longitude': 37.6},
+                  reply_to_message={'message_id': 3, 'from': {'id': 99}})
+        self.assertEqual(len(self.store.rows), 1)
+        self.assertEqual((self.tg.sent, self.model.calls), ([], []))
 
 
 if __name__ == '__main__':

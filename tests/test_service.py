@@ -29,7 +29,15 @@ class MemoryStore:
     def state(self, _): return self.chat.copy()
     def messages(self, _): return deepcopy(self.rows)
     def append(self, chat, role, content, **metadata):
-        self.rows.append(dict(id=self.next_id, role=role, content=content)); self.next_id += 1
+        self.rows.append(dict(id=self.next_id, role=role, content=content,
+                              message_id=metadata.get('message_id'), sender_id=metadata.get('sender_id')))
+        self.next_id += 1
+    def replace_message(self, chat, message_id, content):
+        for row in self.rows:
+            if row.get('message_id') == message_id and row['role'] == 'user':
+                row['content'] = content
+                return True
+        return False
     def clear(self, _): self.rows.clear(); self.chat['summary'] = ''
     def setting(self, chat, key, value): self.chat[key] = value
     def save_summary(self, chat, summary, through):

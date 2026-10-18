@@ -243,6 +243,11 @@ class Store:
         self.conn.execute('''INSERT INTO messages(chat_id,thread_id,role,content,sender_id,telegram_message_id)
             VALUES(%s,%s,%s,%s,%s,%s)''', (chat_id,self.thread_id,role,content,sender_id,message_id))
 
+    def replace_message(self, chat_id, message_id, content):
+        """Rewrite a stored person's message by its Telegram id (live-location movement)."""
+        return self.conn.execute('''UPDATE messages SET content=%s WHERE chat_id=%s AND thread_id=%s
+            AND telegram_message_id=%s AND role='user' ''', (content, chat_id, self.thread_id, message_id)).rowcount > 0
+
     def expire_memory(self, chat_id):
         if self.retention_days:
             with self.transaction():

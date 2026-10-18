@@ -240,6 +240,14 @@ class PostgresTests(unittest.TestCase):
         self.store.maintenance()
         self.assertFalse(self.store.messages(-1))
 
+    def test_replace_message_rewrites_only_the_matching_live_location(self):
+        self.store.state(-1)
+        self.store.append(-1, 'user', 'Speaker 10: [Live location 55.70000,37.60000]', sender_id=10, message_id=7)
+        self.store.append(-1, 'user', 'Speaker 11: hi', sender_id=11, message_id=8)
+        self.assertTrue(self.store.replace_message(-1, 7, 'Speaker 10: [Live location 55.71000,37.61000]'))
+        self.assertFalse(self.store.replace_message(-1, 99, 'nothing'))
+        self.assertEqual([r['content'] for r in self.store.messages(-1)],
+                         ['Speaker 10: [Live location 55.71000,37.61000]', 'Speaker 11: hi'])
     def test_forget_user_clears_derived_data_but_preserves_other_senders(self):
         self.store.state(-1)
         self.store.append(-1, 'user', 'Delete me', sender_id=10, message_id=20)

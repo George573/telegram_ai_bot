@@ -4,7 +4,7 @@ from observability import event, fallback, job_context, job_finished
 from providers import CAPABILITIES, VOICE_MAX_SECONDS, IMAGE_MAX_BYTES
 from media import MediaFailure, split_pcm, to_wav, video_note, voice_pcm
 from personality import named, instructions, settings, DEFAULTS, validate, describe
-from policy import ADMIN_COMMANDS, ADMIN_PAGES, ASKABLE, HELP_PAGES, PANELS, compact_plan, memory_view, valid_limit
+from policy import ADMIN_COMMANDS, ADMIN_PAGES, ASKABLE, HELP_PAGES, PANELS, compact_plan, location_line, memory_view, valid_limit
 from storage import BudgetExceeded
 from model import ModelFailure
 from chat_actions import ChatActions
@@ -275,6 +275,10 @@ class Service:
             payload = None
         if payload:
             state = self.store.state(payload['chat_id'])
+            if payload.get('location'):
+                # Stored for later requests in every mode; never a reply and never a prompt answer.
+                self.store.enqueue(update_id, None if state['paused'] else payload)
+                return
             payload = self.apply_prompt(dict(payload))
             payload['directed'] = payload['directed'] or named(payload['text'], state)
             command = payload['command']
@@ -567,10 +571,28 @@ class Service:
                 self.finish(job, 'media_failed')
 
     # --- Preparation and generation ------------------------------------------------------
+    def save_location(self, job):
+        payload = job['payload']
+        if self.store.state(payload['chat_id'])['paused']:
+            self.finish(job, 'paused')
+            return
+        content = f"Speaker {payload.get('user_id') or 'anonymous'}: {location_line(payload['location'])}"
+        with self.store.transaction():
+            if payload.get('edited'):
+                # Live movement updates its own line; an unknown live location is not added.
+                self.store.replace_message(payload['chat_id'], payload['message_id'], content)
+            else:
+                self.store.append(payload['chat_id'], 'user', content, sender_id=payload.get('user_id'),
+                                  message_id=payload['message_id'])
+            self.finish(job, 'location_saved')
+
     def prepare(self, job):
         payload = job['payload']
         chat_id = payload['chat_id']
         state = self.store.state(chat_id)
+        if payload.get('location'):
+            self.save_location(job)
+            return
         # Administrative controls stay available under abuse or exhausted AI
         # allowance. Personality inference still consumes the bounded quota.
         paid = payload['command'] not in FREE_COMMANDS
