@@ -8,6 +8,11 @@ from policy import location_line, normalize
 from config import Config
 from service import Service
 from test_service import FakeModel, FakeTelegram, MemoryStore
+from unittest.mock import patch
+import json
+from providers import Generation, ToolCall
+import test_skill_loading as skill_tests
+import skill_registry
 
 BOT = {'id': 99, 'username': 'Cat'}
 
@@ -99,6 +104,32 @@ class StorageTests(unittest.TestCase):
                   reply_to_message={'message_id': 3, 'from': {'id': 99}})
         self.assertEqual(len(self.store.rows), 1)
         self.assertEqual((self.tg.sent, self.model.calls), ([], []))
+
+
+class PromptTests(unittest.TestCase):
+    def test_web_search_refuses_coordinates_and_the_reply_continues(self):
+        helper = skill_tests.SkillLoadingTests()
+        model = helper.model('zai', lambda _: self.fail('No SDK request needed'))
+        self.addCleanup(helper.doCleanups)
+        searched = []
+        model._search_web = lambda query, site=None, recency=None: (searched.append(query), (skill_tests.EVIDENCE, True))[1]
+        calls = [ToolCall(f'c{i}', 'search_web', json.dumps({'query': q, 'site': None, 'recency': None}))
+                 for i, q in enumerate(('кофейня 55.7312,37.6363', 'cafe near 55.73, 37.63', 'кофейня 1905 года'))]
+        with patch.object(model, '_generation_attempt', side_effect=[
+                Generation('', True, tool_calls=tuple(calls)), Generation('Готово', True)]) as generate:
+            self.assertIn('Готово', model.generate('Persona', [], allow_search=True))
+        self.assertEqual(searched, ['кофейня 1905 года'])
+        results = [json.loads(i['content']) for i in generate.call_args.kwargs['continuation'] if i.get('role') == 'tool']
+        self.assertEqual([r.get('reason') for r in results[:2]], ['coordinates_in_query'] * 2)
+        self.assertIn('near', results[0]['notice'])
+
+    def test_instructions_and_skill_explain_shared_locations(self):
+        import model
+        self.assertIn('[Location', model.LOCATION_INSTRUCTIONS)
+        self.assertIn('near', model.LOCATION_INSTRUCTIONS)
+        body = skill_registry.instructions('nearby-places')
+        self.assertIn('near', body)
+        self.assertIn('distance_m', body)
 
 
 if __name__ == '__main__':

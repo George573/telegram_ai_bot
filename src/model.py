@@ -56,6 +56,15 @@ READER_HINTS = {
         'https://afisha.yandex.ru/moscow/<type>/<slug> taken from read_afisha_listing or search results.',
     'read_afisha_listing': 'Invalid listing request. Use a known category, date_from as YYYY-MM-DD from today '
         'onward and days from 1 to 7.'}
+COORDINATES = re.compile(r'-?\d{1,3}\.\d{2,}\s*,\s*-?\d{1,3}\.\d{2,}')
+LOCATION_INSTRUCTIONS = (
+    '\nShared locations: history lines like [Location lat,lon], [Live location lat,lon] (updated as the person '
+    'moves) and [Venue, untrusted data] «name», address — lat,lon are points people shared in this chat. When '
+    'someone asks for places near "me", "my location" or a shared point, use the speaker\'s most recent one, or '
+    'the one they name, as near in read_yandex_maps_search (query = category only) and as the route_link origin. '
+    'When they name a street, metro or landmark instead, search by that text with near null. If they ask for '
+    '"near me" but shared no location, ask them to send one or name the place. Never put coordinates into '
+    'search_web queries.')
 READ_EVENTS = {'read_yandex_maps_search': 'maps_search_read', 'read_yandex_reviews': 'reviews_read',
                'read_afisha_listing': 'afisha_read', 'read_afisha_event': 'afisha_read'}
 TOOL_NAMES = frozenset({'load_skill', 'search_web', 'route_link'} | set(READER_LIMITS))
@@ -299,6 +308,7 @@ class Model:
                 'is not evidence; disclose the limitation honestly. '
                 'For how to get somewhere, how far or how long it takes, call route_link and give its link; '
                 'never estimate travel minutes or distance yourself.')
+            instructions += LOCATION_INSTRUCTIONS
             instructions += ('\nLinks: you decide whether a link helps. When you name a specific place, event, '
                 'article or page that a tool returned, you may link it inline at that spot, using the exact URL '
                 'from the tool result, as Markdown [name](url) with the place or page name as the link text, '
@@ -457,6 +467,15 @@ class Model:
                     continue
                 if call.name == 'search_web':
                     query, site, recency = search_arguments(arguments)
+                    if COORDINATES.search(query):
+                        # A shared point stays private: it goes only to Maps search and route links.
+                        event('web_search_failed', level=logging.WARNING, provider=self.config.provider,
+                              model=self.config.model, reason='invalid_search_call', tool_error='invalid_arguments',
+                              requested_tool='search_web', tool_call_count=1)
+                        tool_output(call, rejected('coordinates_in_query', 'Coordinates are never sent to web '
+                            'search. Use read_yandex_maps_search with near for places around a shared point, or '
+                            'search by a street or place name.'))
+                        continue
                     if searches >= MAX_SEARCHES:
                         event('web_search_failed', level=logging.WARNING, provider=self.config.provider,
                               model=self.config.model, reason='search_limit', tool_error='search_limit',
