@@ -93,10 +93,58 @@ def memory_view(rows):
              else row['content']} for index, row in enumerate(rows)]
 
 
+def _degree(value, limit):
+    if type(value) not in (int, float) or not -limit <= value <= limit:
+        return None
+    return round(float(value), 5)
+
+
+def _one_line(value, limit):
+    return (re.sub(r'\s+', ' ', value).strip()[:limit] or None) if isinstance(value, str) else None
+
+
+def location_of(message, edited=False):
+    """A shared point, live location or venue; None when absent or invalid."""
+    venue = message.get('venue') if isinstance(message.get('venue'), dict) else None
+    point = venue.get('location') if venue else message.get('location')
+    if not isinstance(point, dict):
+        return None
+    lat, lon = _degree(point.get('latitude'), 90), _degree(point.get('longitude'), 180)
+    if lat is None or lon is None:
+        return None
+    if venue:
+        return {'kind': 'venue', 'lat': lat, 'lon': lon,
+                'title': _one_line(venue.get('title'), 120), 'address': _one_line(venue.get('address'), 200)}
+    # Edits only come from live locations; the last one (sharing stopped) has no live_period.
+    live = edited or 'live_period' in point
+    return {'kind': 'live' if live else 'point', 'lat': lat, 'lon': lon, 'title': None, 'address': None}
+
+
+def location_line(location):
+    where = f"{location['lat']:.5f},{location['lon']:.5f}"
+    if location['kind'] == 'venue':
+        named = ', '.join(part for part in (f"«{location['title']}»" if location['title'] else None,
+                                            location['address']) if part)
+        return f'[Venue, untrusted data] {named} — {where}' if named else f'[Venue, untrusted data] {where}'
+    return f"[{'Live location' if location['kind'] == 'live' else 'Location'} {where}]"
+
+
 def normalize(update, allowed, bot):
-    message = update.get('message', {})
+    edited = 'edited_message' in update
+    message = update.get('edited_message' if edited else 'message', {})
     chat = message.get('chat', {})
     sender = message.get('from', {})
+    location = location_of(message, edited) if isinstance(message, dict) else None
+    if edited and not location:
+        return None  # Only live-location movement is read from edits.
+    if location:
+        if chat.get('id') not in allowed or chat.get('type') not in {'group', 'supergroup'} or sender.get('is_bot'):
+            return None
+        return dict(chat_id=chat['id'], message_id=message['message_id'], user_id=sender.get('id'),
+            anonymous=bool(message.get('sender_chat')), text='', command='', argument='', reply_to_bot=False,
+            media=None, location=location, edited=edited, directed=False,
+            thread_id=message.get('message_thread_id') if message.get('is_topic_message') else None,
+            reply_to_message_id=None)
     text = message.get('text', message.get('caption', ''))
     media = None
     photos = message.get('photo', [])
@@ -143,7 +191,7 @@ def normalize(update, allowed, bot):
         return None
     return dict(chat_id=chat['id'], message_id=message['message_id'],
         user_id=sender.get('id'), anonymous=bool(message.get('sender_chat')),
-        text=text, command=command, argument=argument, reply_to_bot=reply, media=media,
+        text=text, command=command, argument=argument, reply_to_bot=reply, media=media, location=None, edited=False,
         directed=bool(command or addressed(text, bot['username'], reply)),
         # Ordinary supergroups also set message_thread_id for reply chains; only
         # forum topics are separate conversations that accept it on send.

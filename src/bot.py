@@ -139,7 +139,7 @@ def main():
                     event('scheduled_failed', level=logging.ERROR, reason='unexpected_error')
                 try:
                     updates = telegram.call('getUpdates', offset=store.checkpoint(), limit=100,
-                        timeout=1, allowed_updates=['message', 'callback_query'])
+                        timeout=1, allowed_updates=['message', 'edited_message', 'callback_query'])
                     for update in updates:
                         if not accept_update(service, store, config, identity, update, update_failures):
                             # Keep order: retry from this update on the next poll.
