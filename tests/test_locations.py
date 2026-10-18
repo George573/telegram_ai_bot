@@ -94,9 +94,14 @@ class StorageTests(unittest.TestCase):
         self.assertEqual([r['content'] for r in self.store.rows], ['Speaker 10: [Live location 55.72000,37.62000]'])
         self.assertEqual(self.tg.sent, [])
 
-    def test_edit_without_a_stored_line_is_ignored(self):
-        self.send(1, edited=True, location={'latitude': 55.71, 'longitude': 37.61, 'live_period': 900})
-        self.assertEqual(self.store.rows, [])
+    def test_live_update_after_compaction_adds_a_fresh_line(self):
+        # A long live share outlives its history row in a busy chat; the position must stay known.
+        self.send(1, location={'latitude': 55.70, 'longitude': 37.60, 'live_period': 28800})
+        self.store.rows.clear()  # Compacted into the summary.
+        self.send(2, edited=True, location={'latitude': 55.71, 'longitude': 37.61, 'live_period': 28800})
+        self.send(3, edited=True, location={'latitude': 55.72, 'longitude': 37.62, 'live_period': 28800})
+        self.assertEqual([r['content'] for r in self.store.rows], ['Speaker 10: [Live location 55.72000,37.62000]'])
+        self.assertEqual(self.tg.sent, [])
 
     def test_location_reply_to_a_bot_prompt_is_only_stored(self):
         self.store.save_prompt(-1, 3, 10, '/chat')
@@ -117,11 +122,27 @@ class PromptTests(unittest.TestCase):
                  for i, q in enumerate(('кофейня 55.7312,37.6363', 'cafe near 55.73, 37.63', 'кофейня 1905 года'))]
         with patch.object(model, '_generation_attempt', side_effect=[
                 Generation('', True, tool_calls=tuple(calls)), Generation('Готово', True)]) as generate:
-            self.assertIn('Готово', model.generate('Persona', [], allow_search=True))
+            self.assertIn('Готово', model.generate('Persona', [{'role': 'user', 'content':
+                'Speaker 10: [Location 55.73120,37.63630]'}], allow_search=True))
         self.assertEqual(searched, ['кофейня 1905 года'])
         results = [json.loads(i['content']) for i in generate.call_args.kwargs['continuation'] if i.get('role') == 'tool']
         self.assertEqual([r.get('reason') for r in results[:2]], ['coordinates_in_query'] * 2)
         self.assertIn('near', results[0]['notice'])
+
+    def test_coordinate_check_spares_ordinary_numbers_and_catches_disguised_points(self):
+        from model import mentions_coordinates, shared_points
+        history = [{'role': 'user', 'content': 'Speaker 10: [Location 55.73120,37.63630]'},
+                   {'role': 'user', 'content': 'Speaker 11: [Venue, untrusted data] «Кафе», ул. 1 — 59.93860,30.31410'}]
+        points = shared_points(history)
+        self.assertEqual(points, {(55.7312, 37.6363), (59.9386, 30.3141)})
+        for query in ('Python 3.12, 3.13 changes', 'iPhone 15.10, 15.11', 'курс доллара 92.50, 93.10',
+                      'кофейня 1905 года', 'кофейня Серпуховская'):
+            with self.subTest(allowed=query):
+                self.assertFalse(mentions_coordinates(query, points))
+        for query in ('кофейня 55.7312,37.6363', 'cafe near 55.73, 37.63', '55.7312 37.6363', '55,7312, 37,6363',
+                      'кофе 55.731', 'кафе около 30,3141', 'места 48.8566, 2.3522'):
+            with self.subTest(refused=query):
+                self.assertTrue(mentions_coordinates(query, points))
 
     def test_instructions_and_skill_explain_shared_locations(self):
         import model

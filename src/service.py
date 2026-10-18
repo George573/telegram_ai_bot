@@ -578,10 +578,9 @@ class Service:
             return
         content = f"Speaker {payload.get('user_id') or 'anonymous'}: {location_line(payload['location'])}"
         with self.store.transaction():
-            if payload.get('edited'):
-                # Live movement updates its own line; an unknown live location is not added.
-                self.store.replace_message(payload['chat_id'], payload['message_id'], content)
-            else:
+            # Live movement updates its own line. A miss means the line was compacted or expired while
+            # sharing went on (or began before the bot ran): add it again so the position stays known.
+            if not (payload.get('edited') and self.store.replace_message(payload['chat_id'], payload['message_id'], content)):
                 self.store.append(payload['chat_id'], 'user', content, sender_id=payload.get('user_id'),
                                   message_id=payload['message_id'])
             self.finish(job, 'location_saved')

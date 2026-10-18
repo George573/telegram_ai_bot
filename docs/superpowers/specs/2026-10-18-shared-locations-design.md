@@ -52,8 +52,8 @@ real distances. Sending a location never has to be a reply to the bot, and never
   observability allowlist). No admission token, no compaction, no reply.
 - New message: `store.append(..., message_id=<telegram id>)` as for text.
 - Edited live location: `store.replace_message(chat_id, telegram_message_id, content)` rewrites the stored
-  line for that Telegram message (same chat and thread). If none exists (live location started before the bot
-  ran, or the row was forgotten), the update is ignored.
+  line for that Telegram message (same chat and thread). If none exists (the row was compacted or expired while
+  sharing went on, or sharing began before the bot ran), a fresh line is appended so the position stays known.
 - `/forgetme` and memory reset remove location lines like any other message.
 
 ## Near search (`read_yandex_maps_search`)

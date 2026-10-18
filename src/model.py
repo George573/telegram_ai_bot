@@ -56,7 +56,36 @@ READER_HINTS = {
         'https://afisha.yandex.ru/moscow/<type>/<slug> taken from read_afisha_listing or search results.',
     'read_afisha_listing': 'Invalid listing request. Use a known category, date_from as YYYY-MM-DD from today '
         'onward and days from 1 to 7.'}
-COORDINATES = re.compile(r'-?\d{1,3}\.\d{2,}\s*,\s*-?\d{1,3}\.\d{2,}')
+SHARED_POINT = re.compile(r'(-?\d{1,2}\.\d{5}),(-?\d{1,3}\.\d{5})')
+# A latitude/longitude-looking pair: 4+ decimals each, any separator, dot or Russian decimal comma.
+COORDINATE_PAIR = re.compile(r'(?<![\d.,])-?\d{1,3}[.,]\d{4,}\s*[,;\s]\s*-?\d{1,3}[.,]\d{4,}(?![\d.,])')
+
+
+def shared_points(history):
+    """Points people shared in this conversation, from [Location …]/[Live location …]/[Venue …] lines."""
+    points = set()
+    for row in history:
+        content = row.get('content') if isinstance(row, dict) else None
+        if isinstance(content, str) and ('[Location ' in content or '[Live location ' in content or '[Venue' in content):
+            points.update((float(lat), float(lon)) for lat, lon in SHARED_POINT.findall(content))
+    return points
+
+
+def mentions_coordinates(query, points):
+    """True when a web query carries a shared point (even rounded) or any coordinate-like pair."""
+    if COORDINATE_PAIR.search(query):
+        return True
+    numbers = [float(n.replace(',', '.')) for n in re.findall(r'-?\d{1,3}[.,]\d{2,}', query)]
+    for lat, lon in points:
+        # One number at 3+ decimals (~100 m) already identifies a shared point; at 2 decimals (~1 km) only
+        # the pair does, so "Python 3.12, 3.13" never matches.
+        if any(abs(n - v) < 0.0005 for n in numbers for v in (lat, lon)):
+            return True
+        if any(abs(a - lat) < 0.01 and abs(b - lon) < 0.01 for a, b in zip(numbers, numbers[1:])):  # rounded or cut
+            return True
+    return False
+
+
 LOCATION_INSTRUCTIONS = (
     '\nShared locations: history lines like [Location lat,lon], [Live location lat,lon] (updated as the person '
     'moves) and [Venue, untrusted data] «name», address — lat,lon are points people shared in this chat. When '
@@ -329,6 +358,7 @@ class Model:
         continuation = ()
         sources = []
         evidence = set()
+        private_points = shared_points(history)
         excluded_names = set()
         loaded_skills = {}
         search_confirmed = False
@@ -467,7 +497,7 @@ class Model:
                     continue
                 if call.name == 'search_web':
                     query, site, recency = search_arguments(arguments)
-                    if COORDINATES.search(query):
+                    if mentions_coordinates(query, private_points):
                         # A shared point stays private: it goes only to Maps search and route links.
                         event('web_search_failed', level=logging.WARNING, provider=self.config.provider,
                               model=self.config.model, reason='invalid_search_call', tool_error='invalid_arguments',
