@@ -13,10 +13,12 @@ real distances. Sending a location never has to be a reply to the bot, and never
   `edited_message` updates).
 - A location message is stored in every chat mode and never triggers a reply or a model call. It uses no
   request allowance. While the chat is paused it is ignored like everything else.
-- Near search: `read_yandex_maps_search` gets an optional `near` point. The tools service passes it to Yandex
-  Maps as the map view (`?ll=<lon>,<lat>&z=15`); a live check on 2026-10-18 showed all 10 results within
-  ~2.5 km of a Medvedkovo point. The bot adds a straight-line `distance_m` to each result and sorts nearest
-  first. Walking time still comes only from `route_link`.
+- Near search: `read_yandex_maps_search` gets an optional `near` point. The bot turns it into the nearest
+  Moscow metro or MCC station from a bundled station list and searches by text ("кофейня Серпуховская", the form that was tested).
+  A check on 2026-10-18 (3 places, 10 results each) found station text search far more local than passing
+  coordinates to Yandex (`ll`): 8–10 of 10 results within 1 km versus 1–6, median 0.2–0.5 km versus 0.7–1.7 km;
+  zoom made no difference. The bot adds a straight-line `distance_m` from the real point to each result and
+  sorts nearest first. Walking time still comes only from `route_link`. The tools service is unchanged.
 - Coordinates never go into `search_web` queries.
 - Out of scope: street names for bare pins (needs a geocoding API), live locations started before the bot ran,
   maps in replies.
@@ -47,19 +49,26 @@ real distances. Sending a location never has to be a reply to the bot, and never
   ran, or the row was forgotten), the update is ignored.
 - `/forgetme` and memory reset remove location lines like any other message.
 
+## Station list (`src/moscow_stations.json`)
+
+- Metro and MCC stations with name and coordinates (about 300 entries; MCD and closed stations excluded),
+  generated once from Wikidata (CC0, no attribution needed) by `scripts/moscow_stations.py` and committed.
+  The script is kept so the file can be refreshed when stations open; the bot never fetches it at runtime.
+- Stations sharing a name (interchanges) are merged; a loader validates names and coordinates at import.
+
 ## Near search (`read_yandex_maps_search`)
 
 - Schema: `near: string | null` — `"lat,lon"` copied from a location line in the conversation; null otherwise.
-  Description: use it when someone asks for places near a location they shared; the query then needs only the
-  category ("кофейня"), not a street.
+  Description: use it when someone asks for places near a location they shared; `query` then holds only the
+  category ("кофейня"), never a street or district.
 - Bot validation (`model._reader_call` path): format `lat,lon` with decimals; inside a Moscow-area box
   (lat 55.1–56.1, lon 36.8–38.3). A wrong value returns a fixable error naming `near`, like `route_link`.
-- Tool client sends `near` to `/v1/yandex-maps-search`; `server.maps_search` accepts it (optional, null
-  allowed); `yandex_maps.search_url(query, near=None)` appends `?ll=<lon>%2C<lat>&z=15`.
-- `normalized_search(url, items, exclude_chains, near=None)`: when `near` is set, each result with coordinates
-  gets `distance_m` (haversine, rounded to 10 m) and results are sorted by it (results without coordinates
-  last). The tool result notes that distances are straight-line.
-
+- Station: the nearest station by haversine distance. If it is farther than 2.5 km, the call returns a fixable
+  error telling the model to ask for a street or district instead (no search runs).
+- Query sent to the tools service: `<query> <station>`, the tested form. The tools service and its API are unchanged.
+- Result: each organization with coordinates gets `distance_m` from the real point (rounded to 10 m), results
+  are sorted by it (no coordinates last), and the result carries `near_station: {name, distance_m}` plus a note
+  that distances are straight-line.
 ## Prompts and privacy
 
 - Model instructions (with web on): lines like `[Location …]`, `[Live location …]` and `[Venue …]` are points
@@ -78,7 +87,8 @@ All synthetic data, mocked network.
   location accepted, edited text dropped.
 - service: location stored silently in directed and all modes with no model call and no admission; paused
   ignored; live edit rewrites the matching line; edit with no stored line ignored.
-- maps: `search_url` with `near`; server accepts and rejects `near`; distances and sorting; invalid `near`
-  returns a fixable error; tool schema lists `near`.
+- stations: file loads and validates; nearest station for synthetic points; interchange names merged.
+- maps: `near` becomes `<query> <station>`; distances and sorting; invalid or out-of-area `near` and
+  a point with no station within 2.5 km return fixable errors and run no search; tool schema lists `near`.
 - search_web: coordinates in a query refused.
 - README: a short "Locations" paragraph; skills list unchanged.
