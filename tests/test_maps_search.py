@@ -132,7 +132,7 @@ class ServiceAndClientTests(unittest.TestCase):
     def test_route_validates_arguments(self):
         with patch('server.read_search', return_value=maps.normalized_search('u', [])) as read:
             self.assertEqual(tools_server.maps_search(json.dumps({'query': 'кофейня', 'exclude_chains': True}))[0], 200)
-            read.assert_called_once_with('кофейня', True)
+            read.assert_called_once_with('кофейня', True, None)
         with patch('server.read_search') as read:
             for bad in ({'query': 'кофейня', 'exclude_chains': 'yes'}, {'query': 'https://x.ru'}, {'query': 'кофейня'}):
                 self.assertEqual(tools_server.maps_search(json.dumps(bad))[0], 400)
@@ -172,7 +172,7 @@ class ModelLoopTests(unittest.TestCase):
         with patch.object(model, '_generation_attempt', side_effect=[Generation('', True, tool_calls=(load, search)),
                 Generation(answer, True)]) as generate, patch('model.read_maps_search', return_value=found) as read:
             text = model.generate('Persona', [], allow_search=True)
-        read.assert_called_once_with('кофейня Никольская', True, model.config.tools_url)
+        read.assert_called_once_with('кофейня Никольская', True, model.config.tools_url, near=None)
         self.assertIn('\nhttps://yandex.ru/maps/org/176224105875/reviews', text)
         # The chain was excluded by the tool, so its card is removed entirely, links included.
         self.assertNotIn('Surf Coffee', text)
@@ -215,6 +215,85 @@ class SkillAndCardTests(unittest.TestCase):
                 used = set(re.findall(r'`([a-z_]+)(?:\[\])?`', skill_registry.instructions(name)))
                 self.assertFalse(used & removed)
                 self.assertLessEqual({'items', 'text', 'unconfirmed'}, used)
+
+
+class NearTests(unittest.TestCase):
+    POINT = (55.7266, 37.6248)
+
+    def spread(self):
+        """15 places, the nearest ones last in Yandex order: sorting must happen before the cap."""
+        items = []
+        for index in range(15):
+            km = 3 - index * 0.2  # 3.0 km ... 0.2 km
+            items.append(business(1000 + index, f'Cafe {index}', address=f'ул. {index}',
+                                  coordinates=[37.6248, 55.7266 + km / 111]))
+        items.append(business(2000, 'Nowhere', address='x'))  # no coordinates
+        return items
+
+    def test_near_point_validation(self):
+        self.assertEqual(maps.near_point('55.7266,37.6248'), (55.7266, 37.6248))
+        self.assertEqual(maps.near_point(' 55.7266, 37.6248 '), (55.7266, 37.6248))
+        self.assertIsNone(maps.near_point(None))
+        for bad in ('55.7266', '91,37', '55,-181', 'Moscow', '55.7;37.6', 7):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                maps.near_point(bad)
+
+    def test_search_url_with_and_without_area(self):
+        self.assertEqual(maps.search_url('кофейня'), 'https://yandex.ru/maps/213/moscow/search/%D0%BA%D0%BE%D1%84%D0%B5%D0%B9%D0%BD%D1%8F/')
+        url = maps.search_url('кофейня', near=self.POINT)
+        self.assertTrue(url.endswith('/?ll=37.6248%2C55.7266&z=15&spn=0.0320%2C0.0180&rspn=1'), url)
+        north = maps.search_url('кофейня', near=(64.5, 40.5))  # wider in longitude further north
+        self.assertIn('spn=0.0419%2C0.0180', north)
+
+    def test_results_sorted_by_distance_before_the_cap(self):
+        result = maps.normalized_search('u', self.spread(), near=self.POINT)
+        distances = [r['distance_m'] for r in result['results']]
+        self.assertEqual(len(distances), 10)
+        self.assertEqual(distances, sorted(distances))
+        self.assertEqual(distances[0], 200)
+        self.assertIn('straight-line', result['notice'])
+        plain = maps.normalized_search('u', self.spread())
+        self.assertNotIn('distance_m', plain['results'][0])
+        self.assertEqual(plain['results'][0]['name'], 'Cafe 0')
+
+    def test_server_and_client_pass_near(self):
+        with patch('server.read_search', return_value=maps.normalized_search('u', [])) as read:
+            body = {'query': 'кофейня', 'exclude_chains': False, 'near': '55.7266,37.6248'}
+            self.assertEqual(tools_server.maps_search(json.dumps(body))[0], 200)
+            read.assert_called_once_with('кофейня', False, (55.7266, 37.6248))
+            read.reset_mock()
+            self.assertEqual(tools_server.maps_search(json.dumps({'query': 'кофейня', 'exclude_chains': False}))[0], 200)
+            read.assert_called_once_with('кофейня', False, None)
+            self.assertEqual(tools_server.maps_search(json.dumps({**body, 'near': '91,37'}))[0], 400)
+        url = maps.search_url('кофейня', near=self.POINT)
+        good = maps.normalized_search(url, self.spread(), near=self.POINT)
+        real = httpx.Client
+        seen = []
+        def handler(request):
+            seen.append(json.loads(request.content))
+            return httpx.Response(200, json=good)
+        with patch('tool_client.httpx.Client', lambda **kw: real(transport=httpx.MockTransport(handler), **kw)):
+            result = tool_client.read_maps_search('кофейня', False, 'http://tools:8080', near=self.POINT)
+        self.assertEqual(result['status'], 'ok')
+        self.assertEqual(seen[0]['near'], '55.7266,37.6248')
+
+    def test_model_passes_near_and_explains_a_bad_point(self):
+        model = ModelLoopTests.model(self)
+        good = ToolCall('a', 'read_yandex_maps_search',
+                        '{"query":"кофейня Тверская","exclude_chains":false,"near":"55.7266, 37.6248"}')
+        bad = ToolCall('b', 'read_yandex_maps_search', '{"query":"кофейня","exclude_chains":false,"near":"рядом"}')
+        legacy = ToolCall('c', 'read_yandex_maps_search', '{"query":"кофейня Арбат","exclude_chains":false}')
+        with patch.object(model, '_generation_attempt', side_effect=[
+                Generation('', True, tool_calls=(good, bad, legacy)), Generation('Готово', True)]) as generate, \
+                patch('model.read_maps_search', return_value=maps.normalized_search('u', self.spread(), near=self.POINT)) as read:
+            model.generate('Persona', [], allow_search=True)
+        self.assertEqual(read.call_args_list[0].args, ('кофейня Тверская', False, model.config.tools_url))
+        self.assertEqual(read.call_args_list[0].kwargs, {'near': (55.7266, 37.6248)})
+        self.assertEqual(read.call_args_list[1].kwargs, {'near': None})
+        contents = [json.loads(i['content']) for i in generate.call_args.kwargs['continuation'] if i.get('role') == 'tool']
+        self.assertEqual(contents[1]['reason'], 'invalid_arguments')
+        self.assertIn('near', contents[1]['notice'])
+        self.assertIn('near', json.dumps(maps.READ_YANDEX_MAPS_SEARCH['parameters']['properties']))
 
 
 if __name__ == '__main__':

@@ -41,13 +41,14 @@ MOSCOW = timezone(timedelta(hours=3), 'Europe/Moscow')
 SEARCH_INPUT_TOKENS = 20000
 READER_LIMITS = {'read_yandex_maps_search': 3, 'read_yandex_reviews': MAX_REVIEW_READS,
                  'read_afisha_listing': 2, 'read_afisha_event': 3}
-READER_KEYS = {'read_yandex_maps_search': {'query', 'exclude_chains'}, 'read_yandex_reviews': {'url'},
+READER_KEYS = {'read_yandex_maps_search': {'query', 'exclude_chains', 'near'}, 'read_yandex_reviews': {'url'},
                'read_afisha_event': {'url'}, 'read_afisha_listing': {'category', 'date_from', 'days'}}
 READER_TITLES = {'read_yandex_maps_search': 'Яндекс Карты: поиск', 'read_yandex_reviews': 'Яндекс Карты: отзывы',
                  'read_afisha_listing': 'Яндекс Афиша', 'read_afisha_event': 'Яндекс Афиша: событие'}
 READER_HINTS = {
     'read_yandex_maps_search': 'Invalid Maps search. Use a short plain query such as "кофейня Никольская" '
-        '(category plus street, district or metro), no links, and exclude_chains true or false.',
+        '(category plus street, district or metro), no links, and exclude_chains true or false. '
+        'near is "lat,lon" copied from a shared location line, or null.',
     'read_yandex_reviews': 'Not an organization card. Pass the full card URL, for example '
         'https://yandex.ru/maps/org/<name>/<id>/. Short /maps/-/ links are not supported. '
         'Reviews were not read; do not invent a rating or review analysis.',
@@ -640,7 +641,7 @@ class Model:
                     return 'invalid_arguments'
             elif call.name == 'route_link':
                 continue  # Route arguments are checked per call and explained to the model.
-            elif set(arguments) != READER_KEYS[call.name]:
+            elif set(arguments) | ({'near'} if call.name == 'read_yandex_maps_search' else set()) != READER_KEYS[call.name]:
                 # Reader values are checked per call and returned to the model when wrong.
                 return 'invalid_arguments'
         return None
@@ -662,6 +663,8 @@ class Model:
     def _reader_call(self, call, arguments, results, counts, remember, sources):
         """Run one bounded browser reader; invalid targets go back to the model as tool errors."""
         name = call.name
+        if name == 'read_yandex_maps_search' and isinstance(arguments, dict):
+            arguments = {'near': None, **arguments}  # Optional for providers without strict schemas.
         if not isinstance(arguments, dict) or set(arguments) != READER_KEYS[name]:
             raise ValueError('Invalid reader arguments')
         try:
@@ -670,7 +673,8 @@ class Model:
             elif name == 'read_yandex_maps_search':
                 if type(arguments['exclude_chains']) is not bool:
                     raise ValueError('exclude_chains must be boolean')
-                target = (yandex_maps.search_url(arguments['query']), arguments['exclude_chains'])
+                near = yandex_maps.near_point(arguments['near'])
+                target = (yandex_maps.search_url(arguments['query'], near), arguments['exclude_chains'])
             elif name == 'read_afisha_event':
                 target = yandex_afisha.event_url(arguments['url'])
             else:
@@ -710,7 +714,8 @@ class Model:
         if name == 'read_yandex_reviews':
             call = lambda: read_reviews(target, self.config.tools_url)
         elif name == 'read_yandex_maps_search':
-            call = lambda: read_maps_search(arguments['query'], arguments['exclude_chains'], self.config.tools_url)
+            call = lambda: read_maps_search(arguments['query'], arguments['exclude_chains'], self.config.tools_url,
+                                            near=yandex_maps.near_point(arguments.get('near')))
         elif name == 'read_afisha_event':
             call = lambda: read_afisha_event(target, self.config.tools_url)
         else:

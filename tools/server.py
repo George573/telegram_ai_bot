@@ -46,9 +46,9 @@ def _browse(name, url, reader, busy):
     return 200, result
 
 
-def _request(body, keys):
+def _request(body, keys, optional=frozenset()):
     request = json.loads(body)
-    if not isinstance(request, dict) or set(request) != keys:
+    if not isinstance(request, dict) or not keys <= set(request) <= keys | optional:
         raise ValueError
     return request
 
@@ -80,15 +80,16 @@ def afisha_event(body):
 
 def maps_search(body):
     try:
-        request = _request(body, {'query', 'exclude_chains'})
+        request = _request(body, {'query', 'exclude_chains'}, {'near'})
         if type(request['exclude_chains']) is not bool:
             raise ValueError
-        url = yandex_maps.search_url(request['query'])
+        near = yandex_maps.near_point(request.get('near'))
+        url = yandex_maps.search_url(request['query'], near)
     except (ValueError, TypeError):
         return 400, yandex_maps.unavailable(None, 'invalid_arguments')
     # Same single slot as the browsers: one outbound Yandex request at a time.
     return _browse('maps_search_read', request['query'],
-                   lambda query: read_search(query, request['exclude_chains']),
+                   lambda query: read_search(query, request['exclude_chains'], near),
                    lambda _query, reason: yandex_maps.unavailable(url, reason))
 
 

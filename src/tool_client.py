@@ -52,7 +52,9 @@ def read_afisha_event(value, base_url):
     return _post(base_url, '/v1/afisha-event', {'url': url}, url, EVENT_KEYS, 'sessions', yandex_afisha.unavailable)
 
 
-def read_maps_search(query, exclude_chains, base_url):
-    url = yandex_maps.search_url(query)
-    return _post(base_url, '/v1/yandex-maps-search', {'query': query, 'exclude_chains': exclude_chains},
-                 url, MAPS_KEYS, 'results', yandex_maps.unavailable)
+def read_maps_search(query, exclude_chains, base_url, near=None):
+    url = yandex_maps.search_url(query, near)
+    body = {'query': query, 'exclude_chains': exclude_chains}
+    if near is not None:
+        body['near'] = f'{near[0]},{near[1]}'
+    return _post(base_url, '/v1/yandex-maps-search', body, url, MAPS_KEYS, 'results', yandex_maps.unavailable)

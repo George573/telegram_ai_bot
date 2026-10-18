@@ -22,8 +22,8 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect)
 
 
-def read_search(query, exclude_chains):
-    url = search_url(query)
+def read_search(query, exclude_chains, near=None):
+    url = search_url(query, near)
     try:
         with OPENER.open(urllib.request.Request(url, headers=HEADERS), timeout=TIMEOUT) as response:
             body = response.read(MAX_BYTES + 1)
@@ -41,4 +41,4 @@ def read_search(query, exclude_chains):
     items = state_items(html)
     if items is None:
         return unavailable(url, 'captcha' if 'captcha' in html[:20000].casefold() else 'page_changed')
-    return normalized_search(url, items, exclude_chains)
+    return normalized_search(url, items, exclude_chains, near)
